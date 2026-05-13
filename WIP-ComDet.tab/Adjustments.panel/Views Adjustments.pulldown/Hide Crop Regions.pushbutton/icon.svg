@@ -1,0 +1,26 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 96 96" width="96" height="96">
+  <title>Hide Crop Regions Icon</title>
+  <defs>
+    <linearGradient id="magicGradient" x1="0%" y1="100%" x2="100%" y2="0%">
+      <stop offset="0%" stop-color="#4a90e2" />
+      <stop offset="100%" stop-color="#9013fe" />
+    </linearGradient>
+  </defs>
+
+  <rect x="12" y="12" width="72" height="72" rx="3" fill="none" stroke="#888888" stroke-width="4" stroke-linejoin="round"/>
+
+  <rect x="30" y="30" width="36" height="36" fill="none" stroke="#2c3e50" stroke-width="3" stroke-dasharray="4 4"/>
+  
+  <g fill="none" stroke="#2c3e50" stroke-width="3.5" stroke-linecap="square" stroke-linejoin="miter">
+    <path d="M 24 34 L 24 24 L 34 24" />
+    <path d="M 62 24 L 72 24 L 72 34" />
+    <path d="M 34 72 L 24 72 L 24 62" />
+    <path d="M 72 62 L 72 72 L 62 72" />
+  </g>
+
+  <line x1="26" y1="26" x2="70" y2="70" stroke="#ffffff" stroke-width="10" stroke-linecap="round"/>
+  <line x1="26" y1="26" x2="70" y2="70" stroke="url(#magicGradient)" stroke-width="6" stroke-linecap="round"/>
+
+  <path d="M 82 20 Q 82 24 86 24 Q 82 24 82 28 Q 82 24 78 24 Q 82 24 82 20 Z" fill="#f5a623" />
+  <path d="M 14 74 Q 14 78 18 78 Q 14 78 14 82 Q 14 78 10 78 Q 14 78 14 74 Z" fill="#f5a623" />
+</svg>

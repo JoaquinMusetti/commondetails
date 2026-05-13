@@ -1,0 +1,20 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 96 96" width="96" height="96">
+  <defs>
+    <linearGradient id="magicGradient" x1="0%" y1="100%" x2="100%" y2="0%">
+      <stop offset="0%" stop-color="#4a90e2" />
+      <stop offset="100%" stop-color="#9013fe" />
+    </linearGradient>
+  </defs>
+
+  <rect x="6" y="26" width="46" height="38" fill="none" stroke="#888888" stroke-width="4" rx="2" />
+  <line x1="44" y1="26" x2="44" y2="64" stroke="#888888" stroke-width="3"/>
+  <line x1="24" y1="26" x2="24" y2="64" stroke="#2c3e50" stroke-width="2" stroke-dasharray="3 3"/>
+  <rect x="10" y="32" width="10" height="10" fill="none" stroke="url(#magicGradient)" stroke-width="3" rx="1"/>
+  <rect x="28" y="48" width="12" height="10" fill="none" stroke="url(#magicGradient)" stroke-width="3" rx="1"/>
+
+  <path d="M 56 46 L 66 46 M 60 40 L 66 46 L 60 52" fill="none" stroke="#2c3e50" stroke-width="4" stroke-linecap="round" stroke-linejoin="round"/>
+  
+  <path d="M 72 24 L 82 24 L 90 32 L 90 68 L 72 68 Z" fill="none" stroke="#888888" stroke-width="4" stroke-linejoin="round"/>
+  <path d="M 82 24 L 82 32 L 90 32" fill="none" stroke="#888888" stroke-width="4" stroke-linejoin="round"/>
+  <path d="M 78 40 Q 76 40 76 46 Q 76 52 78 52 M 84 40 Q 86 40 86 46 Q 86 52 84 52" fill="none" stroke="#888888" stroke-width="3" stroke-linecap="round"/>
+</svg>

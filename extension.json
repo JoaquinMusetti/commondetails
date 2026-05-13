@@ -1,0 +1,13 @@
+{
+  "builtin": false,
+  "type": "extension",
+  "rocket_mode_compatible": true,
+  "name": "Common Details",
+  "description": "Common Details workflow tools for HMC",
+  "author": "Slantis",
+  "author_profile": "",
+  "url": "",
+  "website": "",
+  "image": "",
+  "dependencies": []
+}

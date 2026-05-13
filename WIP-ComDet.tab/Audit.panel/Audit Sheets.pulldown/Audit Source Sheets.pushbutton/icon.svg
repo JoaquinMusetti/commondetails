@@ -1,0 +1,38 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 96 96">
+  <defs>
+    <linearGradient id="magicGradient" x1="0%" y1="100%" x2="100%" y2="0%">
+      <stop offset="0%" stop-color="#4a90e2"/>
+      <stop offset="100%" stop-color="#9013fe"/>
+    </linearGradient>
+  </defs>
+
+  <!-- Background sheet (previous snapshot — dashed gray) -->
+  <rect x="10" y="22" width="44" height="56" rx="3"
+        fill="none" stroke="#888888" stroke-width="3.5"
+        stroke-dasharray="5 4" opacity="0.8"/>
+
+  <!-- Foreground sheet (current snapshot — solid gray) -->
+  <rect x="20" y="14" width="44" height="56" rx="3"
+        fill="none" stroke="#888888" stroke-width="4"/>
+  <!-- Sheet content lines -->
+  <line x1="28" y1="26" x2="56" y2="26" stroke="#888888" stroke-width="2" stroke-linecap="round"/>
+  <line x1="28" y1="34" x2="50" y2="34" stroke="#888888" stroke-width="2" stroke-linecap="round"/>
+  <line x1="28" y1="42" x2="56" y2="42" stroke="#888888" stroke-width="2" stroke-linecap="round"/>
+
+  <!-- Magnifier circle (audit action — gradient) -->
+  <circle cx="60" cy="56" r="18" fill="none"
+          stroke="url(#magicGradient)" stroke-width="5"/>
+
+  <!-- Exclamation mark inside magnifier (audit / check) -->
+  <line x1="60" y1="48" x2="60" y2="58"
+        stroke="#f5a623" stroke-width="4" stroke-linecap="round"/>
+  <circle cx="60" cy="64" r="2.5" fill="#f5a623"/>
+
+  <!-- Magnifier handle (dark) -->
+  <line x1="73" y1="69" x2="86" y2="82"
+        stroke="#2c3e50" stroke-width="6" stroke-linecap="round"/>
+
+  <!-- Sparkle accent top-right -->
+  <path d="M 82 10 Q 82 18 90 18 Q 82 18 82 26 Q 82 18 74 18 Q 82 18 82 10 Z"
+        fill="#f5a623"/>
+</svg>

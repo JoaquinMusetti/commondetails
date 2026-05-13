@@ -1,0 +1,20 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 96 96" width="96" height="96">
+  <defs>
+    <linearGradient id="magicGradient" x1="0%" y1="100%" x2="100%" y2="0%">
+      <stop offset="0%" stop-color="#4a90e2" />
+      <stop offset="100%" stop-color="#9013fe" />
+    </linearGradient>
+  </defs>
+
+  <rect x="12" y="28" width="32" height="24" fill="none" stroke="url(#magicGradient)" stroke-width="5" rx="3" opacity="0.5"/>
+  <rect x="22" y="38" width="32" height="24" fill="none" stroke="url(#magicGradient)" stroke-width="5" rx="3" />
+  <path d="M 22 48 L 22 38 L 32 38" fill="none" stroke="#2c3e50" stroke-width="4" stroke-linecap="round" stroke-linejoin="round"/>
+  
+  <path d="M 58 46 L 68 46 M 62 40 L 68 46 L 62 52" fill="none" stroke="#2c3e50" stroke-width="4" stroke-linecap="round" stroke-linejoin="round"/>
+  
+  <path d="M 74 24 L 84 24 L 92 32 L 92 68 L 74 68 Z" fill="none" stroke="#888888" stroke-width="4" stroke-linejoin="round"/>
+  <path d="M 84 24 L 84 32 L 92 32" fill="none" stroke="#888888" stroke-width="4" stroke-linejoin="round"/>
+  <path d="M 80 40 Q 78 40 78 46 Q 78 52 80 52 M 86 40 Q 88 40 88 46 Q 88 52 86 52" fill="none" stroke="#888888" stroke-width="3" stroke-linecap="round"/>
+
+  <path d="M 64 12 Q 64 20 72 20 Q 64 20 64 28 Q 64 20 56 20 Q 64 20 64 12 Z" fill="#f5a623" />
+</svg>
