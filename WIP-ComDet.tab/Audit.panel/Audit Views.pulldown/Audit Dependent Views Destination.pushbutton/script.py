@@ -4,8 +4,16 @@ __doc__ = ('Compares details_views.json against the destination model. '
            'Reports dependent views not accounted for in the JSON, orphaned views, '
            'and view scale mismatches. Offers to delete orphaned or scale-mismatch views.')
 
+import sys
 import json
+import os as _os
 from pyrevit import revit, DB, script, forms
+
+sys.path.append(_os.path.join(
+    _os.path.dirname(_os.path.dirname(_os.path.dirname(_os.path.dirname(_os.path.dirname(_os.path.abspath(__file__)))))),
+    'lib'
+))
+from magictools import ui
 
 doc    = revit.doc
 output = script.get_output()
@@ -30,11 +38,11 @@ output.print_md("**Master views in JSON:** {}".format(len(data["master_views"]))
 
 master_options = sorted([mv["view_name"] for mv in data["master_views"]])
 
-chosen_masters = forms.SelectFromList.show(
+chosen_masters = ui.pick_list(
     master_options,
-    title="Select Master Views to Audit",
+    "Audit Destination Views",
     prompt="Select which master views to include in the audit:",
-    multiselect=True
+    multiselect=True,
 )
 if not chosen_masters:
     script.exit()
@@ -211,11 +219,9 @@ else:
             len(scale_mismatch_placed)))
     msg_lines.append("\nDelete all of them now?")
 
-    confirm_scale = forms.alert(
+    confirm_scale = ui.confirm(
         "\n".join(msg_lines),
-        title="Delete Scale-Mismatch Views",
-        yes=True,
-        no=True
+        title="Audit Destination Views",
     )
 
     if confirm_scale:
@@ -292,13 +298,11 @@ output.print_md("**Total unaccounted:** {} view(s)".format(len(not_in_json)))
 # ─────────────────────────────────────────────────────────────────────────────
 
 if not_in_json_orphan:
-    confirm = forms.alert(
-        "{} orphaned dependent view(s) found — not in JSON and not on any sheet.\n\n"
+    confirm = ui.confirm(
+        "{} orphaned dependent view(s) found -- not in JSON and not on any sheet.\n\n"
         "These are likely leftovers from old imports or renamed views.\n\n"
         "Do you want to delete them now?".format(len(not_in_json_orphan)),
-        title="Delete Orphaned Dependent Views",
-        yes=True,
-        no=True
+        title="Audit Destination Views",
     )
 
     if confirm:
@@ -323,15 +327,13 @@ if not_in_json_orphan:
 # ─────────────────────────────────────────────────────────────────────────────
 
 if not_in_json_placed:
-    confirm_placed = forms.alert(
+    confirm_placed = ui.confirm(
         "{} view(s) are not in the JSON but ARE placed on sheets.\n\n"
         "These may be leftover views from a previous import or manually placed views "
         "that are not part of the current layout.\n\n"
-        "⚠️  Deleting a view also removes it from its sheet.\n\n"
+        "WARNING: Deleting a view also removes it from its sheet.\n\n"
         "Do you want to delete them now?".format(len(not_in_json_placed)),
-        title="Delete Placed Views Not in JSON",
-        yes=True,
-        no=True
+        title="Audit Destination Views",
     )
 
     if confirm_placed:

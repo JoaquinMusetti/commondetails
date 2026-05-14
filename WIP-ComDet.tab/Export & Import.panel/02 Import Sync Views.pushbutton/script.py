@@ -7,8 +7,17 @@ __doc__ = ('Reads details_geometry.json and creates or updates dependent views i
            'Choose to skip or update existing dependent views.')
 
 import json
+import sys
+import os as _os
 from pyrevit import revit, DB, script, forms
 from Autodesk.Revit.DB import CurveLoop, Line, ViewDuplicateOption
+
+_script_dir = _os.path.dirname(_os.path.abspath(__file__))
+_ext_dir = _script_dir
+while _ext_dir and not _ext_dir.endswith('.extension'):
+    _ext_dir = _os.path.dirname(_ext_dir)
+sys.path.append(_os.path.join(_ext_dir, 'lib'))
+from magictools import ui
 
 doc    = revit.doc
 output = script.get_output()
@@ -55,13 +64,13 @@ output.print_md("**Master views in JSON:** {}".format(len(data["master_views"]))
 # 2. Strategy for existing dependent views
 # ─────────────────────────────────────────────────────────────────────────────
 
-strategy = forms.SelectFromList.show(
+strategy = ui.pick_list(
     [
         "Skip existing — do not touch dependent views that already exist",
         "Update existing — re-apply crop boundary to views that already exist",
     ],
-    title="Strategy for Existing Dependent Views",
-    prompt="What to do with dependent views that already exist?",
+    "Strategy for Existing Dependent Views",
+    button_name="Next",
     multiselect=False
 )
 if not strategy:
@@ -83,10 +92,10 @@ link_instances = DB.FilteredElementCollector(doc)\
 link_by_name = {li.Name: li for li in link_instances}
 link_options = [NONE_OPTION] + sorted(link_by_name.keys())
 
-chosen_link = forms.SelectFromList.show(
+chosen_link = ui.pick_list(
     link_options,
-    title="Reference Linked Model",
-    prompt="Select the Common Details linked model, or choose 'None' if you are running this inside Common Details:",
+    "Reference Linked Model",
+    button_name="Select",
     multiselect=False
 )
 if not chosen_link:

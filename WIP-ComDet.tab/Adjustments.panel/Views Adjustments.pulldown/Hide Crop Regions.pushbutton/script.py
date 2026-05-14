@@ -3,7 +3,16 @@ __title__ = 'Hide Crop\nRegions'
 __doc__ = ('Turns off the visible crop region on all dependent views '
            'of the selected master views.')
 
-from pyrevit import revit, DB, script, forms
+import sys
+import os as _os
+from pyrevit import revit, DB, script
+
+_script_dir = _os.path.dirname(_os.path.abspath(__file__))
+_ext_dir = _script_dir
+while _ext_dir and not _ext_dir.endswith('.extension'):
+    _ext_dir = _os.path.dirname(_ext_dir)
+sys.path.append(_os.path.join(_ext_dir, 'lib'))
+from magictools import ui
 
 doc    = revit.doc
 output = script.get_output()
@@ -29,11 +38,10 @@ for v in all_views:
 
 master_views = sorted(master_views, key=lambda v: v.Name)
 
-chosen = forms.SelectFromList.show(
+chosen = ui.pick_list(
     [v.Name for v in master_views],
-    title="Select Master Views",
-    prompt="Select master views to hide crop regions on all their dependents:",
-    multiselect=True
+    "Select Master Views",
+    button_name="Hide Crops"
 )
 if not chosen:
     script.exit()

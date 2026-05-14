@@ -5,8 +5,17 @@ __doc__ = ('Reads a sheets_layout.json file and places dependent views and detai
            'detail number, title on sheet, and detail line updates in two transactions per sheet.')
 
 import json
+import sys
+import os as _os
 import time
 from pyrevit import revit, DB, script, forms
+
+_script_dir = _os.path.dirname(_os.path.abspath(__file__))
+_ext_dir = _script_dir
+while _ext_dir and not _ext_dir.endswith('.extension'):
+    _ext_dir = _os.path.dirname(_ext_dir)
+sys.path.append(_os.path.join(_ext_dir, 'lib'))
+from magictools import ui
 
 doc    = revit.doc
 uidoc  = revit.uidoc
@@ -38,11 +47,10 @@ for e in layout:
     sheets_in_json.append(label)
 sheets_in_json.sort()
 
-chosen_sheets = forms.SelectFromList.show(
+chosen_sheets = ui.pick_list(
     sheets_in_json,
-    title="Select Sheets to Import",
-    prompt="Select one or more sheets:",
-    multiselect=True
+    "Select Sheets to Import",
+    button_name="Import"
 )
 if not chosen_sheets:
     script.exit()
@@ -73,11 +81,10 @@ options = [
     "SHEET ELEMENTS | Detail lines  (delete existing and redraw)",
 ]
 
-chosen_options = forms.SelectFromList.show(
+chosen_options = ui.pick_list(
     options,
-    title="Select What to Update",
-    prompt="Choose what to update on existing viewports and sheet elements:",
-    multiselect=True
+    "Select What to Update",
+    button_name="Apply"
 )
 if chosen_options is None:
     script.exit()
@@ -98,7 +105,7 @@ output.print_md("**Detail lines:** {}".format("Yes"              if DO_LINES    
 # 4. Destination model prefix
 # ─────────────────────────────────────────────────────────────────────────────
 
-dest_prefix = forms.ask_for_string(
+dest_prefix = ui.ask_for_string(
     prompt="Enter the 2-letter prefix of the destination model\n(e.g. AE, AB, AC...)",
     title="Destination Model Prefix",
 )

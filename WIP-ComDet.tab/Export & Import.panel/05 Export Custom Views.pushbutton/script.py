@@ -7,8 +7,17 @@ __doc__ = ('Migration tool — run once per building to export custom dependent 
            'can be imported directly into Common Details.')
 
 import json
+import sys
+import os as _os
 from datetime import date
 from pyrevit import revit, DB, script, forms
+
+_script_dir = _os.path.dirname(_os.path.abspath(__file__))
+_ext_dir = _script_dir
+while _ext_dir and not _ext_dir.endswith('.extension'):
+    _ext_dir = _os.path.dirname(_ext_dir)
+sys.path.append(_os.path.join(_ext_dir, 'lib'))
+from magictools import ui
 
 doc    = revit.doc
 output = script.get_output()
@@ -32,14 +41,15 @@ link_instances = DB.FilteredElementCollector(doc)\
     .ToElements()
 
 if not link_instances:
-    forms.alert("No linked models found in this document.", exitscript=True)
+    ui.alert("No linked models found in this document.", title="Export Custom Views")
+    script.exit()
 
 link_by_name = {li.Name: li for li in link_instances}
 
-chosen_link = forms.SelectFromList.show(
+chosen_link = ui.pick_list(
     sorted(link_by_name.keys()),
-    title="1 of 3 — Reference Linked Model",
-    prompt="Select the Common Details linked model:",
+    "1 of 3 - Reference Linked Model",
+    button_name="Next",
     multiselect=False
 )
 if not chosen_link:
@@ -63,7 +73,8 @@ all_sheets = DB.FilteredElementCollector(doc).OfClass(DB.ViewSheet).ToElements()
 all_sheets = sorted(all_sheets, key=lambda s: s.SheetNumber)
 
 if not all_sheets:
-    forms.alert("No sheets found in the model.", exitscript=True)
+    ui.alert("No sheets found in the model.", title="Export Custom Views")
+    script.exit()
 
 sheet_options   = []
 sheet_by_option = {}
@@ -72,11 +83,10 @@ for s in all_sheets:
     sheet_options.append(label)
     sheet_by_option[label] = s
 
-chosen_options = forms.SelectFromList.show(
+chosen_options = ui.pick_list(
     sheet_options,
-    title="2 of 3 — Select Custom Sheets",
-    prompt="Select the sheets that contain custom views (not shared with Common Details):",
-    multiselect=True
+    "2 of 3 - Select Custom Sheets",
+    button_name="Next"
 )
 if not chosen_options:
     script.exit()
@@ -144,11 +154,12 @@ for sheet in selected_sheets:
             master_to_deps[master_name].append(dep)
 
 if not master_to_deps:
-    forms.alert(
+    ui.alert(
         "No dependent views found on the selected sheets.\n"
         "Make sure the sheets contain dependent views (not master views or schedules).",
-        exitscript=True
+        title="Export Custom Views"
     )
+    script.exit()
 
 total_found = sum(len(deps) for deps in master_to_deps.values())
 output.print_md("**Custom dependent views found:** {}".format(total_found))

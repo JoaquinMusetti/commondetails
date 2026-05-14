@@ -6,10 +6,19 @@ __doc__ = ('Runs Full Sync across multiple open Revit documents in one go. '
            'Phases: clean sheets → clean views → import views → adjust views → import sheet layout.')
 
 import json
+import sys
+import os as _os
 import time
 import System
 from pyrevit import revit, DB, script, forms
 from Autodesk.Revit.DB import CurveLoop, Line
+
+_script_dir = _os.path.dirname(_os.path.abspath(__file__))
+_ext_dir = _script_dir
+while _ext_dir and not _ext_dir.endswith('.extension'):
+    _ext_dir = _os.path.dirname(_ext_dir)
+sys.path.append(_os.path.join(_ext_dir, 'lib'))
+from magictools import ui
 
 uiapp  = __revit__                       # noqa: F821
 app    = uiapp.Application
@@ -43,11 +52,10 @@ with open(sheets_json_path, "r") as f:
 
 # ── Select master views (from JSON) ──
 master_options = sorted([mv["view_name"] for mv in views_data["master_views"]])
-chosen_masters = forms.SelectFromList.show(
+chosen_masters = ui.pick_list(
     master_options,
-    title="3 — Select Master Views",
-    prompt="Select which master views to sync (select all for full sync):",
-    multiselect=True
+    "3 - Select Master Views",
+    button_name="Next"
 )
 if not chosen_masters:
     script.exit()
@@ -82,14 +90,14 @@ for d in app.Documents:
         pass
 
 if not all_open_docs:
-    forms.alert("No project documents open.", exitscript=True)
+    ui.alert("No project documents open.", title="Full Sync PRO")
+    script.exit()
 
 doc_labels = sorted([d.Title for d in all_open_docs])
-chosen_doc_labels = forms.SelectFromList.show(
+chosen_doc_labels = ui.pick_list(
     doc_labels,
-    title="4 — Select Documents to Sync",
-    prompt="Select one or more open Revit documents:",
-    multiselect=True
+    "4 - Select Documents to Sync",
+    button_name="Next"
 )
 if not chosen_doc_labels:
     script.exit()
@@ -102,10 +110,10 @@ chosen_docs = [doc_by_title[lbl] for lbl in chosen_doc_labels if lbl in doc_by_t
 doc_configs = []   # list of (doc, prefix, link_name)
 
 for target_doc in chosen_docs:
-    prefix = forms.ask_for_string(
-        prompt="Enter the 2-letter prefix for:\n\n  {}\n\n(e.g. AE, AB, AC…)".format(
+    prefix = ui.ask_for_string(
+        prompt="Enter the 2-letter prefix for:\n\n  {}\n\n(e.g. AE, AB, AC...)".format(
             target_doc.Title),
-        title="Prefix — {}".format(target_doc.Title)
+        title="Prefix - {}".format(target_doc.Title)
     )
     if not prefix:
         script.exit()
@@ -115,15 +123,15 @@ for target_doc in chosen_docs:
     link_instances = DB.FilteredElementCollector(target_doc)\
         .OfClass(DB.RevitLinkInstance).ToElements()
     if not link_instances:
-        forms.alert("No linked models in '{}'. Skipping.".format(target_doc.Title))
+        ui.alert("No linked models in '{}'. Skipping.".format(target_doc.Title),
+                 title="Full Sync PRO")
         continue
 
     link_by_name = {li.Name: li for li in link_instances}
-    link_name = forms.SelectFromList.show(
+    link_name = ui.pick_list(
         sorted(link_by_name.keys()),
-        title="Linked Model — {}".format(target_doc.Title),
-        prompt="Select Common Details link for '{}':\n(should be the same in all docs)".format(
-            target_doc.Title),
+        "Linked Model - {}".format(target_doc.Title),
+        button_name="Select",
         multiselect=False
     )
     if not link_name:
@@ -132,20 +140,21 @@ for target_doc in chosen_docs:
     doc_configs.append((target_doc, prefix, link_name))
 
 if not doc_configs:
-    forms.alert("No documents configured. Nothing to do.", exitscript=True)
+    ui.alert("No documents configured. Nothing to do.", title="Full Sync PRO")
+    script.exit()
 
 # ── Confirmation ──
 summary_lines = []
 for target_doc, prefix, link_name in doc_configs:
-    summary_lines.append("  • {} → prefix: {} → link: {}".format(
+    summary_lines.append("  * {} -> prefix: {} -> link: {}".format(
         target_doc.Title, prefix, link_name))
 
-confirm = forms.alert(
+confirm = ui.confirm(
     "Ready to run Full Sync PRO:\n\n"
     "Documents ({}):\n{}\n\n"
-    "  • {} sheets from JSON\n"
-    "  • {} dependent views in scope\n"
-    "  • {} master views\n\n"
+    "  * {} sheets from JSON\n"
+    "  * {} dependent views in scope\n"
+    "  * {} master views\n\n"
     "Per document this will:\n"
     "  0. Unload the linked model\n"
     "  1. Remove viewports not in JSON from sheets\n"
@@ -160,9 +169,9 @@ confirm = forms.alert(
         len(layout),
         views_in_scope,
         len(chosen_masters)),
-    title="Full Sync PRO — Confirm",
-    yes=True,
-    no=True
+    title="Full Sync PRO - Confirm",
+    yes_text="Run Full Sync PRO",
+    width=640, height=500
 )
 if not confirm:
     script.exit()
@@ -816,14 +825,13 @@ docs_with_unloaded = [(r, r["_link_type"]) for r in all_results
                       if r.get("link_unloaded") and "_link_type" in r]
 
 if docs_with_unloaded:
-    do_reload = forms.alert(
+    do_reload = ui.confirm(
         "All syncs complete.\n\n"
         "Reload linked models in {} document(s)?\n\n"
         "(Skip if the link is open in another session.)".format(
             len(docs_with_unloaded)),
         title="Reload Links?",
-        yes=True,
-        no=True
+        yes_text="Reload"
     )
     if do_reload:
         output.print_md("\n---")

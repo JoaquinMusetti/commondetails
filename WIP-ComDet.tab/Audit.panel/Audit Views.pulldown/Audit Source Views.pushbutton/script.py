@@ -6,7 +6,16 @@ __doc__ = ('Compares details_geometry.json against the current model. '
 
 import json
 import os
+import sys as _sys
+import os as _os
 from pyrevit import revit, DB, script, forms
+
+_script_dir = _os.path.dirname(_os.path.abspath(__file__))
+_ext_dir = _script_dir
+while _ext_dir and not _ext_dir.endswith('.extension'):
+    _ext_dir = _os.path.dirname(_ext_dir)
+_sys.path.append(_os.path.join(_ext_dir, 'lib'))
+from magictools import ui
 
 doc    = revit.doc
 output = script.get_output()
@@ -212,16 +221,15 @@ if not rename_suggestions:
     output.print_md("\nRun **Export Dependent Views** to update the JSON before importing.")
     script.exit()
 
-confirm = forms.alert(
+confirm = ui.confirm(
     "{} possible rename(s) detected based on matching Title on Sheet.\n\n{}\n\n"
     "Confirm these renames and generate renames.json?".format(
         len(rename_suggestions),
-        "\n".join(["  {} → {}".format(r["old_name"], r["new_name"])
+        "\n".join(["  {} -> {}".format(r["old_name"], r["new_name"])
                    for r in rename_suggestions])
     ),
     title="Confirm Renames",
-    yes=True,
-    no=True
+    yes_text="Confirm"
 )
 
 if not confirm:

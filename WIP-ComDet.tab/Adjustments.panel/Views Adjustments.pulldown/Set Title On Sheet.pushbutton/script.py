@@ -12,7 +12,16 @@ a prefix is added to the view name in the future.
 
 Usage: Run the tool and select one or more master views from the list."""
 
-from pyrevit import revit, DB, script, forms
+import sys
+import os as _os
+from pyrevit import revit, DB, script
+
+_script_dir = _os.path.dirname(_os.path.abspath(__file__))
+_ext_dir = _script_dir
+while _ext_dir and not _ext_dir.endswith('.extension'):
+    _ext_dir = _os.path.dirname(_ext_dir)
+sys.path.append(_os.path.join(_ext_dir, 'lib'))
+from magictools import ui
 
 doc    = revit.doc
 output = script.get_output()
@@ -42,11 +51,10 @@ view_by_name = {}
 for v in master_views:
     view_by_name[v.Name] = v
 
-chosen = forms.SelectFromList.show(
+chosen = ui.pick_list(
     [v.Name for v in master_views],
-    title="Select Master Views",
-    prompt="Select one or more master views:",
-    multiselect=True
+    "Select Master Views",
+    button_name="Set Titles"
 )
 if not chosen:
     script.exit()

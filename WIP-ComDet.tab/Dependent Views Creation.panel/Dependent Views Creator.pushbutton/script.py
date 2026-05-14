@@ -6,7 +6,16 @@ __doc__ = ('Creates dependent views from Detail Line rectangles drawn in the act
            'rectangle to name the dependent view. '
            'The tool will ask you to pick both the LineStyle and the TextNoteType at startup.')
 
-from pyrevit import revit, DB, script, forms
+import os as _os
+import sys
+
+sys.path.append(_os.path.join(
+    _os.path.dirname(_os.path.dirname(_os.path.dirname(_os.path.dirname(_os.path.abspath(__file__))))),
+    'lib'
+))
+from magictools import ui
+
+from pyrevit import revit, DB, script
 from Autodesk.Revit.DB import (
     FilteredElementCollector,
     ViewDuplicateOption,
@@ -256,20 +265,22 @@ def main():
     active_view = uidoc.ActiveView
 
     if not active_view.CanViewBeDuplicated(ViewDuplicateOption.AsDependent):
-        forms.alert(
+        ui.alert(
             "The active view does not support dependent views.\n"
             "Switch to a floor plan, elevation, or section view.",
-            exitscript=True,
+            title="Dependent Views Creator",
         )
+        script.exit()
 
     # ── Pick crop box linestyle ──
     linestyle_names = get_linestyle_names(doc)
     if not linestyle_names:
-        forms.alert("No line styles found in document.", exitscript=True)
+        ui.alert("No line styles found in document.", title="Dependent Views Creator")
+        script.exit()
 
-    chosen_linestyle = forms.SelectFromList.show(
+    chosen_linestyle = ui.pick_list(
         linestyle_names,
-        title="Crop Box LineStyle",
+        "Crop Box LineStyle",
         prompt="Select the LineStyle used for crop box rectangles:",
         multiselect=False,
     )
@@ -279,11 +290,12 @@ def main():
     # ── Pick view name TextNoteType ──
     textnote_type_names = get_textnote_type_names(doc)
     if not textnote_type_names:
-        forms.alert("No TextNote types found in document.", exitscript=True)
+        ui.alert("No TextNote types found in document.", title="Dependent Views Creator")
+        script.exit()
 
-    chosen_tn_type = forms.SelectFromList.show(
+    chosen_tn_type = ui.pick_list(
         textnote_type_names,
-        title="View Name TextNoteType",
+        "View Name TextNoteType",
         prompt="Select the TextNoteType used for view name labels:",
         multiselect=False,
     )
@@ -296,11 +308,12 @@ def main():
     # ── Collect and filter selection by linestyle ──
     sel_ids = list(uidoc.Selection.GetElementIds())
     if not sel_ids:
-        forms.alert(
+        ui.alert(
             "Nothing selected.\n"
             "Select the Detail Lines that form the crop box rectangles.",
-            exitscript=True,
+            title="Dependent Views Creator",
         )
+        script.exit()
 
     detail_lines = []
     for eid in sel_ids:
@@ -314,13 +327,14 @@ def main():
             pass
 
     if not detail_lines:
-        forms.alert(
+        ui.alert(
             "No Detail Lines with LineStyle '{}' in selection.\n\n"
             "Make sure:\n"
-            "  • Lines are DetailLines (not ModelLines)\n"
-            "  • Lines have the correct LineStyle assigned".format(chosen_linestyle),
-            exitscript=True,
+            "  - Lines are DetailLines (not ModelLines)\n"
+            "  - Lines have the correct LineStyle assigned".format(chosen_linestyle),
+            title="Dependent Views Creator",
         )
+        script.exit()
 
     output.print_md("**Detail Lines with correct LineStyle:** {}".format(len(detail_lines)))
 
@@ -328,14 +342,15 @@ def main():
     loops = build_loops(segments)
 
     if not loops:
-        forms.alert(
+        ui.alert(
             "No closed loops detected.\n\n"
             "Make sure that:\n"
-            "  • Each rectangle is fully closed\n"
-            "  • Endpoints touch each other (use Snap to Endpoint)\n"
-            "  • No loose lines are mixed in",
-            exitscript=True,
+            "  - Each rectangle is fully closed\n"
+            "  - Endpoints touch each other (use Snap to Endpoint)\n"
+            "  - No loose lines are mixed in",
+            title="Dependent Views Creator",
         )
+        script.exit()
 
     output.print_md("**Loops detected:** {}  \n".format(len(loops)))
 

@@ -4,8 +4,17 @@ __doc__ = ('Exports viewport positions, detail numbers, and detail lines '
            'from selected sheets to a dated Sheet layout JSON file.')
 
 import json
+import sys
+import os as _os
 from datetime import date
 from pyrevit import revit, DB, script, forms
+
+_script_dir = _os.path.dirname(_os.path.abspath(__file__))
+_ext_dir = _script_dir
+while _ext_dir and not _ext_dir.endswith('.extension'):
+    _ext_dir = _os.path.dirname(_ext_dir)
+sys.path.append(_os.path.join(_ext_dir, 'lib'))
+from magictools import ui
 
 doc    = revit.doc
 output = script.get_output()
@@ -19,7 +28,8 @@ all_sheets = list(all_sheets)
 all_sheets.sort(key=lambda s: s.SheetNumber)
 
 if not all_sheets:
-    forms.alert("No sheets found in the model.", exitscript=True)
+    ui.alert("No sheets found in the model.", title="Export Sheet Layout")
+    script.exit()
 
 sheet_options   = []
 sheet_by_option = {}
@@ -28,11 +38,10 @@ for s in all_sheets:
     sheet_options.append(label)
     sheet_by_option[label] = s
 
-chosen_options = forms.SelectFromList.show(
+chosen_options = ui.pick_list(
     sheet_options,
-    title="Select Sheets to Export",
-    prompt="Select one or more sheets:",
-    multiselect=True
+    "Select Sheets to Export",
+    button_name="Export"
 )
 if not chosen_options:
     script.exit()

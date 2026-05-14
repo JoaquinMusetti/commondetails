@@ -10,11 +10,18 @@ __doc__ = ('Compares two Sheet Layout JSON snapshots (previous vs. current) '
            '  - View type changes (e.g. Section -> FloorPlan)\n'
            '  - Detail number changes on views that stayed on the same sheet')
 
+import sys
 import json
 import os
 import re
 from datetime import date, datetime
 from pyrevit import script, forms
+
+sys.path.append(os.path.join(
+    os.path.dirname(os.path.dirname(os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)))))),
+    'lib'
+))
+from magictools import ui
 
 try:
     # System.Windows.Forms.Clipboard is available under IronPython / pyRevit
@@ -906,10 +913,9 @@ def build_pdf_blocks():
 
 # Offer to save PDF
 output.print_md("\n---")
-if forms.alert(
+if ui.confirm(
         "Do you want to save this report as a PDF?",
-        title="Export PDF",
-        options=["Yes, save PDF", "No"]) == "Yes, save PDF":
+        title="Updates Report"):
     default_name = "{0}_DetailSheetsUpdateReport.pdf".format(
         date.today().strftime("%Y%m%d"))
     pdf_path = forms.save_file(

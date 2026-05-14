@@ -5,10 +5,19 @@ __doc__ = ('Runs all cleanup and import operations in sequence with no interrupt
            'All inputs are collected upfront. Auto-applies all changes.')
 
 import json
+import sys
+import os as _os
 import time
 import System
 from pyrevit import revit, DB, script, forms
 from Autodesk.Revit.DB import CurveLoop, Line
+
+_script_dir = _os.path.dirname(_os.path.abspath(__file__))
+_ext_dir = _script_dir
+while _ext_dir and not _ext_dir.endswith('.extension'):
+    _ext_dir = _os.path.dirname(_ext_dir)
+sys.path.append(_os.path.join(_ext_dir, 'lib'))
+from magictools import ui
 
 doc    = revit.doc
 output = script.get_output()
@@ -42,13 +51,14 @@ with open(sheets_json_path, "r") as f:
 link_instances = DB.FilteredElementCollector(doc)\
     .OfClass(DB.RevitLinkInstance).ToElements()
 if not link_instances:
-    forms.alert("No linked models found in document.", exitscript=True)
+    ui.alert("No linked models found in document.", title="Full Sync")
+    script.exit()
 
 link_by_name  = {li.Name: li for li in link_instances}
-chosen_link   = forms.SelectFromList.show(
+chosen_link   = ui.pick_list(
     sorted(link_by_name.keys()),
-    title="3 of 5 — Reference Linked Model",
-    prompt="Select the linked model (Common Details):",
+    "3 of 5 - Reference Linked Model",
+    button_name="Next",
     multiselect=False
 )
 if not chosen_link:
@@ -58,20 +68,19 @@ link_instance  = link_by_name[chosen_link]
 link_transform = link_instance.GetTotalTransform()
 link_type      = doc.GetElement(link_instance.GetTypeId())  # RevitLinkType for unload/reload
 
-dest_prefix = forms.ask_for_string(
+dest_prefix = ui.ask_for_string(
     prompt="Enter the 2-letter prefix of the destination model\n(e.g. AE, AB, AC...)",
-    title="4 of 5 — Destination Model Prefix"
+    title="4 of 5 - Destination Model Prefix"
 )
 if not dest_prefix:
     script.exit()
 dest_prefix = dest_prefix.strip().upper()
 
 master_options = sorted([mv["view_name"] for mv in views_data["master_views"]])
-chosen_masters = forms.SelectFromList.show(
+chosen_masters = ui.pick_list(
     master_options,
-    title="5 of 5 — Select Master Views",
-    prompt="Select which master views to sync (select all for full sync):",
-    multiselect=True
+    "5 of 5 - Select Master Views",
+    button_name="Sync"
 )
 if not chosen_masters:
     script.exit()
@@ -83,12 +92,12 @@ views_in_scope = sum(
     if mv["view_name"] in chosen_masters_set
 )
 
-confirm = forms.alert(
+confirm = ui.confirm(
     "Ready to run Full Sync:\n\n"
-    "  • {} sheets from JSON\n"
-    "  • {} dependent views in scope\n"
-    "  • Destination prefix: {}\n"
-    "  • Linked model: {}\n\n"
+    "  * {} sheets from JSON\n"
+    "  * {} dependent views in scope\n"
+    "  * Destination prefix: {}\n"
+    "  * Linked model: {}\n\n"
     "This will:\n"
     "  0. Unload the linked model (speeds up the sync significantly)\n"
     "  1. Remove viewports not in JSON from sheets (views are kept)\n"
@@ -99,9 +108,8 @@ confirm = forms.alert(
     "  6. Ask whether to reload the linked model\n\n"
     "No further prompts except the final reload question. Continue?".format(
         len(layout), views_in_scope, dest_prefix, chosen_link),
-    title="Full Sync — Confirm",
-    yes=True,
-    no=True
+    title="Full Sync - Confirm",
+    yes_text="Run Full Sync"
 )
 if not confirm:
     script.exit()
@@ -812,14 +820,13 @@ output.print_md("✅ Created **{}** | Updated **{}** | Lines **{}**".format(
 
 link_reloaded = False
 if link_unloaded:
-    do_reload = forms.alert(
+    do_reload = ui.confirm(
         "Sync complete.\n\nReload linked model now?\n\n"
         "  {}\n\n"
         "(Skip if the model is open in another session or you prefer to keep it unloaded.)".format(
             chosen_link),
         title="Reload Link?",
-        yes=True,
-        no=True
+        yes_text="Reload"
     )
     if do_reload:
         output.print_md("\n---")

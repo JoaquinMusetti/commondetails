@@ -1,42 +1,69 @@
 # -*- coding: utf-8 -*-
-__title__ = 'Annotation \nCrop Offset'
+__title__ = 'Annotation\nCrop Offset'
 __doc__ = ('Sets the annotation crop offset (in inches) for selected views. '
            'Supports 3D views, floor plans, ceiling plans, area plans, elevations, and sections. '
-           'Master and dependent views can be filtered and searched.')
+           'Use the preset buttons to fill all four fields at once.')
+
+import os as _os
+import sys
+_script_dir = _os.path.dirname(_os.path.abspath(__file__))
+_ext_dir = _script_dir
+while _ext_dir and not _ext_dir.endswith('.extension'):
+    _ext_dir = _os.path.dirname(_ext_dir)
+sys.path.append(_os.path.join(_ext_dir, 'lib'))
+from magictools import ui
 
 import System
-import clr
-from pyrevit import revit, forms
-from Autodesk.Revit.DB import *
+from pyrevit import revit, DB
 
-from System.Windows import (
-    Window, Thickness, HorizontalAlignment,
-    Style, Setter
+from Autodesk.Revit.DB import (
+    FilteredElementCollector, View, ViewType, ElementId
 )
-from System.Windows.Controls import (
-    StackPanel, Grid, TextBox, Label, Button,
-    ListView, ListViewItem,
-    GridView, GridViewColumn,
-    SelectionMode, ColumnDefinition, Orientation,
-    GridViewColumnHeader, CheckBox
-)
+from System.Windows.Controls import Button, CheckBox
+from System.Windows import Thickness
+from System.Windows.Media import SolidColorBrush, Color
 from System.Collections.ObjectModel import ObservableCollection
-from System.ComponentModel import SortDescription, ListSortDirection
-from System.Windows.Data import Binding, CollectionViewSource
-from System.Windows.Media import SolidColorBrush, Colors
 
 doc = revit.doc
 
-# ------------------------------------------------------------
-# Units
-# ------------------------------------------------------------
+# ─── Unit helpers ────────────────────────────────────────────────────────────
+
 def inches_to_feet(v):
     return v / 12.0
 
-# ------------------------------------------------------------
-# Setter with 3 fallbacks for maximum compatibility
-# ------------------------------------------------------------
+# ─── Constants ───────────────────────────────────────────────────────────────
+
+EXCLUDED_VIEW_TYPES = (
+    ViewType.DrawingSheet,
+    ViewType.ProjectBrowser,
+    ViewType.SystemBrowser,
+    ViewType.Internal,
+    ViewType.Schedule,
+    ViewType.DraftingView,
+    ViewType.Legend,
+)
+
+FILTERABLE_VIEW_TYPES = [
+    ("3D Views",      ViewType.ThreeD),
+    ("Floor Plans",   ViewType.FloorPlan),
+    ("Ceiling Plans", ViewType.CeilingPlan),
+    ("Area Plans",    ViewType.AreaPlan),
+    ("Elevations",    ViewType.Elevation),
+    ("Sections",      ViewType.Section),
+]
+
+# ─── Collect views ───────────────────────────────────────────────────────────
+
+all_views = [
+    v for v in FilteredElementCollector(doc).OfClass(View)
+    if not v.IsTemplate
+    and v.ViewType not in EXCLUDED_VIEW_TYPES
+]
+
+# ─── Annotation crop helpers ─────────────────────────────────────────────────
+
 def set_annotation_crop_offset(rm, top, bottom, left, right):
+    # Method 1: direct properties
     try:
         rm.TopAnnotationCropOffset    = top
         rm.BottomAnnotationCropOffset = bottom
@@ -45,35 +72,31 @@ def set_annotation_crop_offset(rm, top, bottom, left, right):
         return True
     except Exception:
         pass
-
+    # Method 2: .NET reflection
     try:
         t     = rm.GetType()
         flags = System.Reflection.BindingFlags.Public | System.Reflection.BindingFlags.Instance
         props = {p.Name: p for p in t.GetProperties(flags)}
-        pairs = [
+        for name, val in [
             ("TopAnnotationCropOffset",    top),
             ("BottomAnnotationCropOffset", bottom),
             ("LeftAnnotationCropOffset",   left),
             ("RightAnnotationCropOffset",  right),
-        ]
-        for name, val in pairs:
+        ]:
             if name in props:
                 props[name].SetValue(rm, val, None)
         return True
     except Exception:
         pass
-
+    # Method 3: unified method (some Revit versions)
     try:
         rm.SetAnnotationCropOffset(top, bottom, left, right)
         return True
     except Exception:
         pass
-
     return False
 
-# ------------------------------------------------------------
-# Check if a view supports annotation crop
-# ------------------------------------------------------------
+
 def view_supports_annotation_crop(v):
     try:
         rm = v.GetCropRegionShapeManager()
@@ -84,40 +107,7 @@ def view_supports_annotation_crop(v):
     except Exception as ex:
         return False, str(ex)
 
-# ------------------------------------------------------------
-# Excluded ViewTypes
-# ------------------------------------------------------------
-EXCLUDED_VIEW_TYPES = (
-    ViewType.DrawingSheet,
-    ViewType.ProjectBrowser,
-    ViewType.SystemBrowser,
-    ViewType.Internal,
-    ViewType.Schedule,
-    ViewType.DraftingView,
-    ViewType.Legend
-)
 
-FILTERABLE_VIEW_TYPES = {
-    "3D Views":      ViewType.ThreeD,
-    "Floor Plans":   ViewType.FloorPlan,
-    "Ceiling Plans": ViewType.CeilingPlan,
-    "Area Plans":    ViewType.AreaPlan,
-    "Elevations":    ViewType.Elevation,
-    "Sections":      ViewType.Section
-}
-
-# ------------------------------------------------------------
-# Collect views (once)
-# ------------------------------------------------------------
-all_views = [
-    v for v in FilteredElementCollector(doc).OfClass(View)
-    if not v.IsTemplate
-    and v.ViewType not in EXCLUDED_VIEW_TYPES
-]
-
-# ------------------------------------------------------------
-# Build Primary → Dependents map
-# ------------------------------------------------------------
 def build_view_map(views):
     primaries  = {}
     dependents = {}
@@ -129,292 +119,314 @@ def build_view_map(views):
             dependents.setdefault(pid, []).append(v)
     return primaries, dependents
 
-# ------------------------------------------------------------
-# Data object for ListView
-# ------------------------------------------------------------
+# ─── Row colours ─────────────────────────────────────────────────────────────
+
+_BRUSH_NORMAL = SolidColorBrush(Color.FromRgb(0xE8, 0xEB, 0xF5))  # #E8EBF5 normal
+_BRUSH_DEP    = SolidColorBrush(Color.FromRgb(0xF5, 0xA6, 0x23))  # #f5a623 amber – dependents
+
+# ─── Data object for DataGrid ─────────────────────────────────────────────────
+
 class ViewItem(object):
     def __init__(self, view):
         self.View     = view
         self.ViewType = view.ViewType.ToString()
-
         pid = view.GetPrimaryViewId()
         self.IsDependent = pid != ElementId.InvalidElementId
-
         if self.IsDependent:
             master = doc.GetElement(pid)
-            self.ViewName   = u"{} \u2013 {}".format(master.Name, view.Name)
-            self.Foreground = SolidColorBrush(Colors.DarkRed)
+            self.ViewName      = u"  {} – {}".format(master.Name, view.Name)
+            self.RowForeground = _BRUSH_DEP
         else:
-            self.ViewName   = view.Name
-            self.Foreground = SolidColorBrush(Colors.Black)
+            self.ViewName      = view.Name
+            self.RowForeground = _BRUSH_NORMAL
 
-# ------------------------------------------------------------
-# Main window
-# ------------------------------------------------------------
-class AnnotationCropWindow(Window):
-    def __init__(self):
-        self.Title   = "Annotation Crop Offset (Inches)"
-        self.Width   = 760
-        self.Height  = 820
-        self.Padding = Thickness(10)
+# ─── XAML ────────────────────────────────────────────────────────────────────
 
-        self.last_sort = None
-        self.last_dir  = ListSortDirection.Ascending
+_BODY = """
+  <Grid>
+    <Grid.Resources>
+      <Style TargetType="CheckBox">
+        <Setter Property="Foreground" Value="#E8EBF5"/>
+        <Setter Property="VerticalContentAlignment" Value="Center"/>
+      </Style>
+    </Grid.Resources>
+    <Grid.RowDefinitions>
+      <RowDefinition Height="Auto"/>
+      <RowDefinition Height="Auto"/>
+      <RowDefinition Height="Auto"/>
+      <RowDefinition Height="Auto"/>
+      <RowDefinition Height="Auto"/>
+      <RowDefinition Height="*"/>
+    </Grid.RowDefinitions>
 
-        main = StackPanel()
-        self.Content = main
+    <!-- Preset quick-fill buttons -->
+    <StackPanel x:Name="presetPanel" Grid.Row="0"
+                Orientation="Horizontal" Margin="0,0,0,10"/>
 
-        # ---- Presets ----
-        preset_panel = StackPanel(
-            Orientation=Orientation.Horizontal,
-            Margin=Thickness(0, 0, 0, 10)
-        )
-        presets = [
-            ("1/8\"", 0.125), ("1/4\"", 0.25), ("1/2\"", 0.5),
-            ("3/4\"", 0.75),  ("1\"",   1.0),  ("2\"",   2.0)
-        ]
-        for label, value in presets:
-            b = Button(Content=label, Width=60, Margin=Thickness(3))
-            b.Click += lambda s, e, v=value: self.apply_preset(v)
-            preset_panel.Children.Add(b)
-        main.Children.Add(preset_panel)
+    <!-- Four offset inputs -->
+    <Grid Grid.Row="1" Margin="0,0,0,10">
+      <Grid.ColumnDefinitions>
+        <ColumnDefinition/>
+        <ColumnDefinition/>
+        <ColumnDefinition/>
+        <ColumnDefinition/>
+      </Grid.ColumnDefinitions>
+      <StackPanel Grid.Column="0" Margin="0,0,8,0">
+        <TextBlock Text="Top (in)" Foreground="#8088A8" FontSize="11" Margin="0,0,0,4"/>
+        <TextBox x:Name="txtTop" Text="0"/>
+      </StackPanel>
+      <StackPanel Grid.Column="1" Margin="0,0,8,0">
+        <TextBlock Text="Bottom (in)" Foreground="#8088A8" FontSize="11" Margin="0,0,0,4"/>
+        <TextBox x:Name="txtBottom" Text="0"/>
+      </StackPanel>
+      <StackPanel Grid.Column="2" Margin="0,0,8,0">
+        <TextBlock Text="Left (in)" Foreground="#8088A8" FontSize="11" Margin="0,0,0,4"/>
+        <TextBox x:Name="txtLeft" Text="0"/>
+      </StackPanel>
+      <StackPanel Grid.Column="3">
+        <TextBlock Text="Right (in)" Foreground="#8088A8" FontSize="11" Margin="0,0,0,4"/>
+        <TextBox x:Name="txtRight" Text="0"/>
+      </StackPanel>
+    </Grid>
 
-        # ---- Inputs de offset ----
-        grid = Grid(Margin=Thickness(0, 0, 0, 10))
-        for _ in range(4):
-            grid.ColumnDefinitions.Add(ColumnDefinition())
+    <!-- View type filter checkboxes (row 1) -->
+    <StackPanel x:Name="filterPanel" Grid.Row="2"
+                Orientation="Horizontal" Margin="0,0,0,4"/>
 
-        self.inputs = {}
-        for i, k in enumerate(["Top", "Bottom", "Left", "Right"]):
-            st = StackPanel(Margin=Thickness(5))
-            st.Children.Add(Label(Content="{} (in)".format(k)))
-            tb = TextBox(Text="0", Width=70)
-            st.Children.Add(tb)
-            Grid.SetColumn(st, i)
-            grid.Children.Add(st)
-            self.inputs[k] = tb
-        main.Children.Add(grid)
+    <!-- Master / Dependent toggles (row 2) — added dynamically below -->
+    <StackPanel x:Name="togglePanel" Grid.Row="3"
+                Orientation="Horizontal" Margin="0,0,0,8"/>
 
-        # ---- CheckBoxes de ViewType ----
-        main.Children.Add(Label(Content="View Type Filters:"))
-        self.viewtype_checks = {}
-        cb_panel = StackPanel(
-            Orientation=Orientation.Horizontal,
-            Margin=Thickness(0, 0, 0, 10)
-        )
-        for label, vt in FILTERABLE_VIEW_TYPES.items():
-            cb = CheckBox(
-                Content=label,
-                IsChecked=True,
-                Margin=Thickness(5, 0, 10, 0)
-            )
-            cb.Checked   += self.on_filter_changed
-            cb.Unchecked += self.on_filter_changed
-            self.viewtype_checks[vt] = cb
-            cb_panel.Children.Add(cb)
+    <!-- Search textbox -->
+    <TextBox x:Name="txtSearch" Grid.Row="4"
+             Margin="0,0,0,8" ToolTip="Type to filter views..."/>
 
-        # ── Show/hide master views ──
-        self.show_masters_cb = CheckBox(
-            Content="Master Views",
-            IsChecked=True,
-            Margin=Thickness(15, 0, 10, 0)
-        )
-        self.show_masters_cb.Checked   += self.on_filter_changed
-        self.show_masters_cb.Unchecked += self.on_filter_changed
-        cb_panel.Children.Add(self.show_masters_cb)
+    <!-- Views list -->
+    <DataGrid x:Name="grid" Grid.Row="5"
+              SelectionMode="Extended"
+              CanUserSortColumns="True"
+              AutoGenerateColumns="False">
+      <DataGrid.RowStyle>
+        <Style TargetType="DataGridRow">
+          <Setter Property="Foreground" Value="{Binding RowForeground}"/>
+          <Style.Triggers>
+            <Trigger Property="IsMouseOver" Value="True">
+              <Setter Property="Background" Value="#283358"/>
+            </Trigger>
+            <Trigger Property="IsSelected" Value="True">
+              <Setter Property="Background" Value="#3A1F70"/>
+              <Setter Property="Foreground" Value="#FFFFFF"/>
+            </Trigger>
+          </Style.Triggers>
+        </Style>
+      </DataGrid.RowStyle>
+      <DataGrid.Columns>
+        <DataGridTextColumn Header="VIEW TYPE" Width="200" Binding="{Binding ViewType}"/>
+        <DataGridTextColumn Header="VIEW NAME" Width="*"   Binding="{Binding ViewName}"/>
+      </DataGrid.Columns>
+    </DataGrid>
+  </Grid>
+"""
 
-        main.Children.Add(cb_panel)
+_FOOTER = """
+  <Grid>
+    <TextBlock x:Name="lblCount" VerticalAlignment="Center" Foreground="#5A6286"/>
+    <StackPanel HorizontalAlignment="Right" Orientation="Horizontal">
+      <Button x:Name="btnApply"  Content="Apply"  Style="{StaticResource BtnPrimary}" Margin="0,0,8,0"/>
+      <Button x:Name="btnCancel" Content="Cancel" Style="{StaticResource BtnGhost}"/>
+    </StackPanel>
+  </Grid>
+"""
 
-        # ---- Search ----
-        main.Children.Add(Label(Content="Search views:"))
-        self.search_tb = TextBox(Margin=Thickness(0, 0, 0, 5))
-        self.search_tb.TextChanged += self.on_search_changed
-        main.Children.Add(self.search_tb)
+# ─── Build window ─────────────────────────────────────────────────────────────
 
-        # ---- ListView ----
-        self.items = ObservableCollection[ViewItem]()
-        self.refresh_view_list()
+win = ui.parse(
+    "Annotation Crop Offset",
+    "Set annotation crop offset (inches) for selected views",
+    _BODY, _FOOTER,
+    width=800, height=760,
+)
 
-        self.listview = ListView(
-            Height=460,
-            SelectionMode=SelectionMode.Extended,
-            ItemsSource=self.items
-        )
-        gv = GridView()
-        gv.Columns.Add(GridViewColumn(
-            Header="View Type",
-            DisplayMemberBinding=Binding("ViewType"),
-            Width=220
-        ))
-        gv.Columns.Add(GridViewColumn(
-            Header="View Name",
-            DisplayMemberBinding=Binding("ViewName"),
-            Width=480
-        ))
-        self.listview.View = gv
-        self.listview.AddHandler(
-            GridViewColumnHeader.ClickEvent,
-            System.Windows.RoutedEventHandler(self.on_header_click)
-        )
-        style = Style(ListViewItem)
-        style.Setters.Add(
-            Setter(ListViewItem.ForegroundProperty, Binding("Foreground"))
-        )
-        self.listview.ItemContainerStyle = style
-        main.Children.Add(self.listview)
+presetPanel = win.FindName("presetPanel")
+filterPanel = win.FindName("filterPanel")
+togglePanel = win.FindName("togglePanel")
+txtTop      = win.FindName("txtTop")
+txtBottom   = win.FindName("txtBottom")
+txtLeft     = win.FindName("txtLeft")
+txtRight    = win.FindName("txtRight")
+txtSearch   = win.FindName("txtSearch")
+grid        = win.FindName("grid")
+lblCount    = win.FindName("lblCount")
+btnApply    = win.FindName("btnApply")
+btnCancel   = win.FindName("btnCancel")
 
-        # ---- Buttons ----
-        btn_panel = StackPanel(
-            Orientation=Orientation.Horizontal,
-            HorizontalAlignment=HorizontalAlignment.Right
-        )
-        apply_btn  = Button(Content="Apply",  Width=90, Margin=Thickness(5))
-        cancel_btn = Button(Content="Cancel", Width=90, Margin=Thickness(5))
-        apply_btn.Click  += self.on_apply
-        cancel_btn.Click += lambda s, e: self.Close()
-        btn_panel.Children.Add(apply_btn)
-        btn_panel.Children.Add(cancel_btn)
-        main.Children.Add(btn_panel)
+inputs = {"Top": txtTop, "Bottom": txtBottom, "Left": txtLeft, "Right": txtRight}
 
-    # ----------------------------------------------------------
-    def populate_items(self, views):
-        self.items.Clear()
-        for v in views:
-            self.items.Add(ViewItem(v))
+# ─── Populate DataGrid ────────────────────────────────────────────────────────
 
-    def apply_preset(self, value):
-        for tb in self.inputs.values():
-            tb.Text = str(value)
+items = ObservableCollection[ViewItem]()
+grid.ItemsSource = items
 
-    def refresh_view_list(self):
-        txt = self.search_tb.Text.lower()
-        show_masters = self.show_masters_cb.IsChecked
-        active_types = [
-            vt for vt, cb in self.viewtype_checks.items()
-            if cb.IsChecked
-        ]
-        filtered = [v for v in all_views if v.ViewType in active_types]
-        if txt:
-            primaries, dependents = build_view_map(filtered)
-            result = []
-            for pid, pv in primaries.items():
-                name_match = txt in pv.Name.lower() or txt in pv.ViewType.ToString().lower()
-                dep_list   = dependents.get(pid, [])
-                dep_match  = any(txt in dv.Name.lower() for dv in dep_list)
-                if name_match or dep_match:
-                    if show_masters:
-                        result.append(pv)
-                    result.extend(dep_list)
-            filtered = result
-        else:
-            primaries, dependents = build_view_map(filtered)
-            result = []
-            for pid, pv in primaries.items():
+# ─── State ────────────────────────────────────────────────────────────────────
+
+vtype_checks    = {}    # ViewType enum → CheckBox
+show_masters_cb = None  # set after filterPanel is built
+show_deps_cb    = None
+
+# ─── Preset buttons ───────────────────────────────────────────────────────────
+
+presets = [
+    ('1/8"', 0.125), ('1/4"', 0.25), ('1/2"', 0.5),
+    ('3/4"', 0.75),  ('1"',   1.0),  ('2"',   2.0),
+]
+
+def _make_preset_handler(val):
+    def handler(s, e):
+        for tb in inputs.values():
+            tb.Text = str(val)
+    return handler
+
+for _label, _val in presets:
+    _b = Button()
+    _b.Content = _label
+    _b.Style   = win.FindResource("BtnGhost")
+    _b.Margin  = Thickness(0, 0, 6, 0)
+    _b.Click  += _make_preset_handler(_val)
+    presetPanel.Children.Add(_b)
+
+# ─── List refresh ─────────────────────────────────────────────────────────────
+
+def refresh_list(s=None, e=None):
+    active       = [vt for vt, cb in vtype_checks.items() if cb.IsChecked]
+    txt          = txtSearch.Text.strip().lower()
+    show_masters = show_masters_cb.IsChecked if show_masters_cb else True
+    show_deps    = show_deps_cb.IsChecked    if show_deps_cb    else True
+    filtered     = [v for v in all_views if v.ViewType in active]
+
+    primaries, dependents = build_view_map(filtered)
+    result = []
+
+    if txt:
+        for pid, pv in primaries.items():
+            name_match = txt in pv.Name.lower() or txt in pv.ViewType.ToString().lower()
+            dep_list   = dependents.get(pid, [])
+            dep_match  = any(txt in dv.Name.lower() for dv in dep_list)
+            if name_match or dep_match:
                 if show_masters:
                     result.append(pv)
+                if show_deps:
+                    result.extend(dep_list)
+    else:
+        for pid, pv in primaries.items():
+            if show_masters:
+                result.append(pv)
+            if show_deps:
                 result.extend(dependents.get(pid, []))
-            filtered = result
-        self.populate_items(filtered)
 
-    def on_search_changed(self, s, e):
-        self.refresh_view_list()
+    items.Clear()
+    for v in result:
+        items.Add(ViewItem(v))
+    lblCount.Text = u"{} view(s)".format(len(items))
 
-    def on_filter_changed(self, s, e):
-        self.refresh_view_list()
+# ─── View type checkboxes ─────────────────────────────────────────────────────
 
-    def on_header_click(self, sender, e):
-        header = e.OriginalSource
-        if not isinstance(header, GridViewColumnHeader):
-            return
-        field = "ViewType" if header.Content == "View Type" else "ViewName"
-        view  = CollectionViewSource.GetDefaultView(self.items)
-        view.SortDescriptions.Clear()
-        if self.last_sort == field:
-            self.last_dir = (
-                ListSortDirection.Descending
-                if self.last_dir == ListSortDirection.Ascending
-                else ListSortDirection.Ascending
-            )
-        else:
-            self.last_dir = ListSortDirection.Ascending
-        view.SortDescriptions.Add(SortDescription(field, self.last_dir))
-        self.last_sort = field
+for _label, _vt in FILTERABLE_VIEW_TYPES:
+    _cb            = CheckBox()
+    _cb.Content    = _label
+    _cb.IsChecked  = True
+    _cb.Margin     = Thickness(0, 0, 14, 0)
+    _cb.Checked   += refresh_list
+    _cb.Unchecked += refresh_list
+    vtype_checks[_vt] = _cb
+    filterPanel.Children.Add(_cb)
 
-    # ----------------------------------------------------------
-    def on_apply(self, sender, args):
-        try:
-            selected = [i.View for i in self.listview.SelectedItems]
-            if not selected:
-                forms.alert("No views selected.")
-                return
+# Master / Dependent toggles — second row
+show_masters_cb           = CheckBox()
+show_masters_cb.Content   = "Master Views"
+show_masters_cb.IsChecked = True
+show_masters_cb.Margin    = Thickness(0, 0, 14, 0)
+show_masters_cb.Checked   += refresh_list
+show_masters_cb.Unchecked += refresh_list
+togglePanel.Children.Add(show_masters_cb)
+
+show_deps_cb           = CheckBox()
+show_deps_cb.Content   = "Dependent Views"
+show_deps_cb.IsChecked = True
+show_deps_cb.Margin    = Thickness(0, 0, 0, 0)
+show_deps_cb.Checked   += refresh_list
+show_deps_cb.Unchecked += refresh_list
+togglePanel.Children.Add(show_deps_cb)
+
+txtSearch.TextChanged += refresh_list
+
+# Initial populate
+refresh_list()
+
+# ─── Apply handler ────────────────────────────────────────────────────────────
+
+def on_apply(s, e):
+    selected = [it.View for it in grid.SelectedItems]
+    if not selected:
+        ui.alert("No views selected.", title="Annotation Crop Offset")
+        return
+
+    try:
+        offsets = {k: inches_to_feet(float(inputs[k].Text)) for k in inputs}
+    except ValueError:
+        ui.alert("Please enter valid numbers in all offset fields.",
+                 title="Annotation Crop Offset")
+        return
+
+    skipped = []
+    failed  = []
+    applied = 0
+
+    with revit.Transaction("Set Annotation Crop Offset"):
+        for v in selected:
+            try:
+                if not v.CropBoxActive:
+                    v.CropBoxActive = True
+            except Exception:
+                pass
+            try:
+                if not v.AnnotationCropActive:
+                    v.AnnotationCropActive = True
+                    doc.Regenerate()
+            except Exception:
+                pass
+
+            supported, reason = view_supports_annotation_crop(v)
+            if not supported:
+                skipped.append(u"{} ({})".format(v.Name, reason))
+                continue
 
             try:
-                offsets = {
-                    k: inches_to_feet(float(self.inputs[k].Text))
-                    for k in self.inputs
-                }
-            except ValueError:
-                forms.alert("Please enter valid numbers in all offset fields.")
-                return
-
-            skipped = []
-            failed  = []
-            applied = 0
-
-            with revit.Transaction("Set Annotation Crop Offset"):
-                for v in selected:
-                    try:
-                        if not v.CropBoxActive:
-                            v.CropBoxActive = True
-                    except Exception:
-                        pass
-
-                    try:
-                        if not v.AnnotationCropActive:
-                            v.AnnotationCropActive = True
-                            doc.Regenerate()
-                    except Exception:
-                        pass
-
-                    supported, reason = view_supports_annotation_crop(v)
-                    if not supported:
-                        skipped.append(u"{} ({})".format(v.Name, reason))
-                        continue
-
-                    try:
-                        rm = v.GetCropRegionShapeManager()
-                        ok = set_annotation_crop_offset(
-                            rm,
-                            offsets["Top"],
-                            offsets["Bottom"],
-                            offsets["Left"],
-                            offsets["Right"]
-                        )
-                        if ok:
-                            applied += 1
-                        else:
-                            failed.append(v.Name)
-                    except Exception as ex:
-                        failed.append(u"{}: {}".format(v.Name, str(ex)))
-
-            msg_parts = [u"DONE \u2705 Applied to {} view(s).".format(applied)]
-            if skipped:
-                msg_parts.append(
-                    u"\nSkipped {} view(s):\n  {}".format(
-                        len(skipped), u"\n  ".join(skipped[:20])
-                    )
+                rm = v.GetCropRegionShapeManager()
+                ok = set_annotation_crop_offset(
+                    rm,
+                    offsets["Top"], offsets["Bottom"],
+                    offsets["Left"], offsets["Right"],
                 )
-            if failed:
-                msg_parts.append(
-                    u"\nFailed on {} view(s):\n  {}".format(
-                        len(failed), u"\n  ".join(failed[:20])
-                    )
-                )
-            forms.alert(u"\n".join(msg_parts))
-            self.Close()
+                if ok:
+                    applied += 1
+                else:
+                    failed.append(v.Name)
+            except Exception as ex:
+                failed.append(u"{}: {}".format(v.Name, str(ex)))
 
-        except Exception as ex:
-            forms.alert(str(ex), title="ERROR")
+    msg_parts = [u"Applied to {} view(s).".format(applied)]
+    if skipped:
+        msg_parts.append(u"\nSkipped {}:\n  {}".format(
+            len(skipped), u"\n  ".join(skipped[:20])))
+    if failed:
+        msg_parts.append(u"\nFailed {}:\n  {}".format(
+            len(failed), u"\n  ".join(failed[:20])))
 
-# ------------------------------------------------------------
-AnnotationCropWindow().ShowDialog()
+    ui.alert(u"\n".join(msg_parts), title="Annotation Crop Offset")
+    win.Close()
+
+
+btnApply.Click  += on_apply
+btnCancel.Click += lambda s, e: win.Close()
+
+win.ShowDialog()

@@ -5,8 +5,16 @@ __doc__ = ('Compares sheets_layout.json against the destination model. '
            'and viewport type mismatches. Warns about viewport types missing from the destination '
            'model and offers to remove or delete orphaned viewports.')
 
+import sys
+import os as _os
 import json
 from pyrevit import revit, DB, script, forms
+
+sys.path.append(_os.path.join(
+    _os.path.dirname(_os.path.dirname(_os.path.dirname(_os.path.dirname(_os.path.dirname(_os.path.abspath(__file__)))))),
+    'lib'
+))
+from magictools import ui
 
 doc    = revit.doc
 output = script.get_output()
@@ -31,9 +39,9 @@ output.print_md("**Sheets in JSON:** {}".format(len(layout)))
 # 2. Destination model prefix
 # ─────────────────────────────────────────────────────────────────────────────
 
-dest_prefix = forms.ask_for_string(
+dest_prefix = ui.ask_for_string(
     prompt="Enter the 2-letter prefix of the destination model\n(e.g. AE, AB, AC...)",
-    title="Destination Model Prefix",
+    title="Audit Sheet Layout",
 )
 if not dest_prefix:
     script.exit()
@@ -134,16 +142,15 @@ else:
         "\n> **Action required before importing:** Transfer these types from the source "
         "model using **Manage → Transfer Project Standards → Viewport Types**."
     )
-    forms.alert(
+    ui.alert(
         "{} viewport type(s) from the JSON are missing in this model:\n\n{}\n\n"
         "Transfer them from the source model via:\n"
-        "Manage → Transfer Project Standards → Viewport Types\n\n"
+        "Manage > Transfer Project Standards > Viewport Types\n\n"
         "Then re-run this audit before importing.".format(
             len(missing_types),
-            "\n".join("  • " + t for t in missing_types)
+            "\n".join("  - " + t for t in missing_types)
         ),
-        title="Missing Viewport Types",
-        warn_icon=True
+        title="Audit Sheet Layout",
     )
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -333,13 +340,13 @@ if all_orphaned_vp_ids:
 # ─────────────────────────────────────────────────────────────────────────────
 
 if all_orphaned_vp_ids:
-    action = forms.alert(
-        "{} orphaned viewport(s) found on sheets.\n\n"
+    action = ui.pick_list(
+        ["Remove from sheets (keep views)", "Delete viewports", "Do nothing"],
+        "Audit Sheet Layout",
+        prompt="{} orphaned viewport(s) found on sheets.\n\n"
         "These viewports are not in the JSON and will cause detail number "
         "conflicts during import.\n\n"
         "What do you want to do?".format(len(all_orphaned_vp_ids)),
-        title="Orphaned Viewports",
-        options=["Remove from sheets (keep views)", "Delete viewports", "Do nothing"]
     )
 
     if action == "Remove from sheets (keep views)":

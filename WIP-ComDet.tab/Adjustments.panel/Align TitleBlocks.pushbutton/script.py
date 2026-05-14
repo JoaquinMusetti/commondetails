@@ -4,7 +4,16 @@ __doc__ = ('Moves titleblocks on selected sheets to match the position '
            'of the titleblock on a reference sheet. '
            'Select a reference sheet, then select the target sheets to align.')
 
-from pyrevit import revit, DB, script, forms
+import sys
+import os as _os
+from pyrevit import revit, DB, script
+
+_script_dir = _os.path.dirname(_os.path.abspath(__file__))
+_ext_dir = _script_dir
+while _ext_dir and not _ext_dir.endswith('.extension'):
+    _ext_dir = _os.path.dirname(_ext_dir)
+sys.path.append(_os.path.join(_ext_dir, 'lib'))
+from magictools import ui
 
 doc    = revit.doc
 output = script.get_output()
@@ -27,10 +36,10 @@ for s in all_sheets:
 # 2. Pick reference sheet
 # ─────────────────────────────────────────────────────────────────────────────
 
-chosen_ref = forms.SelectFromList.show(
+chosen_ref = ui.pick_list(
     sheet_options,
-    title="Select Reference Sheet",
-    prompt="Select the sheet whose titleblock position is correct:",
+    "Select Reference Sheet",
+    button_name="Next",
     multiselect=False
 )
 if not chosen_ref:
@@ -47,7 +56,8 @@ tb_collector = DB.FilteredElementCollector(doc, ref_sheet.Id)\
     .ToElements()
 
 if not tb_collector:
-    forms.alert("No titleblock found on reference sheet.", exitscript=True)
+    ui.alert("No titleblock found on reference sheet.", title="Align Titleblocks")
+    script.exit()
 
 ref_tb       = list(tb_collector)[0]
 ref_location = ref_tb.Location.Point
@@ -68,11 +78,10 @@ output.print_md("**Reference position:** X={:.4f}  Y={:.4f}".format(
 # Remove reference sheet from options
 target_options = [o for o in sheet_options if o != chosen_ref]
 
-chosen_targets = forms.SelectFromList.show(
+chosen_targets = ui.pick_list(
     target_options,
-    title="Select Sheets to Align",
-    prompt="Select sheets to move titleblock to reference position:",
-    multiselect=True
+    "Select Sheets to Align",
+    button_name="Align"
 )
 if not chosen_targets:
     script.exit()

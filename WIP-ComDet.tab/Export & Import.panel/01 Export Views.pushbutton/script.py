@@ -6,8 +6,17 @@ __doc__ = ('Exports crop boundaries, view names, and title on sheet '
            'Coordinates are stored in the document\'s local space.')
 
 import json
+import sys
+import os as _os
 from datetime import date
 from pyrevit import revit, DB, script, forms
+
+_script_dir = _os.path.dirname(_os.path.abspath(__file__))
+_ext_dir = _script_dir
+while _ext_dir and not _ext_dir.endswith('.extension'):
+    _ext_dir = _os.path.dirname(_ext_dir)
+sys.path.append(_os.path.join(_ext_dir, 'lib'))
+from magictools import ui
 
 doc    = revit.doc
 output = script.get_output()
@@ -41,11 +50,10 @@ for v in all_views:
 master_views = sorted(master_views, key=lambda v: v.Name)
 view_by_name = {v.Name: v for v in master_views}
 
-chosen_views = forms.SelectFromList.show(
+chosen_views = ui.pick_list(
     [v.Name for v in master_views],
-    title="Select Master Views to Export",
-    prompt="Select one or more master views:",
-    multiselect=True
+    "Select Master Views to Export",
+    button_name="Export"
 )
 if not chosen_views:
     script.exit()

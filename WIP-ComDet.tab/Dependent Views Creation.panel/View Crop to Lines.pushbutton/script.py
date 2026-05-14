@@ -4,7 +4,16 @@ __doc__ = ('Creates Detail Lines from the CropBox of selected Dependent Views. '
            'Works with sections, elevations, and floor plans. '
            'Select the crop boundary elements, choose a line style, and run the tool.')
 
-from pyrevit import revit, DB, script, forms
+import sys
+import os as _os
+from pyrevit import revit, DB, script
+
+_script_dir = _os.path.dirname(_os.path.abspath(__file__))
+_ext_dir = _script_dir
+while _ext_dir and not _ext_dir.endswith('.extension'):
+    _ext_dir = _os.path.dirname(_ext_dir)
+sys.path.append(_os.path.join(_ext_dir, 'lib'))
+from magictools import ui
 
 doc   = revit.doc
 uidoc = revit.uidoc
@@ -15,7 +24,9 @@ view  = uidoc.ActiveView
 # --------------------------------------------------------------------------
 selection_ids = uidoc.Selection.GetElementIds()
 if not selection_ids:
-    forms.alert("Select the crop boundaries of the dependent views.", exitscript=True)
+    ui.alert("Select the crop boundaries of the dependent views.",
+             title="View Crop to Lines")
+    script.exit()
 
 # --------------------------------------------------------------------------
 # 2. Dependent views indexed by Id and by name
@@ -34,7 +45,8 @@ for vid in view.GetDependentViewIds():
         pass
 
 if not dep_by_id:
-    forms.alert("The active view has no dependent views.", exitscript=True)
+    ui.alert("The active view has no dependent views.", title="View Crop to Lines")
+    script.exit()
 
 # --------------------------------------------------------------------------
 # 3. Helper - Strategy C
@@ -81,7 +93,8 @@ for eid in selection_ids:
         unresolved.append(elem)
 
 if not target_views:
-    forms.alert("No matching dependent view found.", exitscript=True)
+    ui.alert("No matching dependent view found.", title="View Crop to Lines")
+    script.exit()
 
 # --------------------------------------------------------------------------
 # 5. Line style picker
@@ -97,12 +110,13 @@ def get_all_line_styles(document):
 
 all_styles = get_all_line_styles(doc)
 if not all_styles:
-    forms.alert("No line styles found in the document.", exitscript=True)
+    ui.alert("No line styles found in the document.", title="View Crop to Lines")
+    script.exit()
 
-chosen = forms.SelectFromList.show(
+chosen = ui.pick_list(
     sorted(all_styles.keys()),
-    title="Select Line Style",
-    prompt="What type of detail line do you want to use?",
+    "Select Line Style",
+    button_name="Create Lines",
     multiselect=False
 )
 if not chosen:
@@ -166,4 +180,4 @@ if unresolved:
 if errors:
     msg += "\n\nErrors:\n" + "\n".join(errors)
 
-forms.alert(msg, title="Dependent Views -> Detail Lines")
+ui.alert(msg, title="Dependent Views -> Detail Lines")

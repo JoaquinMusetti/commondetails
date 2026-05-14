@@ -4,7 +4,16 @@ __doc__ = ('Creates a TextNote at the center of the CropBox of selected Dependen
            'The text content is the View Name of the dependent view. '
            'Select the crop boundary elements, choose a text type, and run the tool.')
 
-from pyrevit import revit, DB, script, forms
+import os as _os
+import sys
+
+sys.path.append(_os.path.join(
+    _os.path.dirname(_os.path.dirname(_os.path.dirname(_os.path.dirname(_os.path.abspath(__file__))))),
+    'lib'
+))
+from magictools import ui
+
+from pyrevit import revit, DB, script
 
 doc   = revit.doc
 uidoc = revit.uidoc
@@ -15,7 +24,8 @@ view  = uidoc.ActiveView
 # --------------------------------------------------------------------------
 selection_ids = uidoc.Selection.GetElementIds()
 if not selection_ids:
-    forms.alert("Select the crop boundaries of the dependent views.", exitscript=True)
+    ui.alert("Select the crop boundaries of the dependent views.", title="View Name to Text Notes")
+    script.exit()
 
 # --------------------------------------------------------------------------
 # 2. Dependent views indexed by Id and by name
@@ -34,7 +44,8 @@ for vid in view.GetDependentViewIds():
         pass
 
 if not dep_by_id:
-    forms.alert("The active view has no dependent views.", exitscript=True)
+    ui.alert("The active view has no dependent views.", title="View Name to Text Notes")
+    script.exit()
 
 # --------------------------------------------------------------------------
 # 3. Helper - Strategy C: read View Name parameter from element
@@ -81,7 +92,8 @@ for eid in selection_ids:
         unresolved.append(elem)
 
 if not target_views:
-    forms.alert("No matching dependent view found.", exitscript=True)
+    ui.alert("No matching dependent view found.", title="View Name to Text Notes")
+    script.exit()
 
 # --------------------------------------------------------------------------
 # 5. Choose TextNoteType
@@ -98,13 +110,14 @@ for t in text_note_types:
         type_dict[t.Name] = t
 
 if not type_dict:
-    forms.alert("No TextNote types found in the document.", exitscript=True)
+    ui.alert("No TextNote types found in the document.", title="View Name to Text Notes")
+    script.exit()
 
-chosen_type_name = forms.SelectFromList.show(
+chosen_type_name = ui.pick_list(
     sorted(type_dict.keys()),
-    title="Select Text Type",
+    "Select Text Type",
     prompt="What text type do you want to use?",
-    multiselect=False
+    multiselect=False,
 )
 if not chosen_type_name:
     script.exit()
@@ -159,4 +172,4 @@ if unresolved:
 if errors:
     msg += "\n\nErrors:\n" + "\n".join(errors)
 
-forms.alert(msg, title="Dependent Views -> Text Notes")
+ui.alert(msg, title="View Name to Text Notes")
