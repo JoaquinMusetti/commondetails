@@ -1,11 +1,10 @@
 # -*- coding: utf-8 -*-
 __title__ = 'Import\nSheets with Views'
-__doc__ = ('Reads a Sheets with Views JSON (exported by "Export Sheets with Views") '
-           'and in a single run: creates or updates dependent views, then places '
-           'them on the destination model sheets. '
-           'When importing into the Common Details file itself, choose '
-           '"None (I\'m importing views into the Common Details file)" '
-           'as the linked model.')
+__doc__ = ('Reads a Sheets with Views JSON (produced by "Export Sheets with '
+           'Views") and recreates the dependent views + sheet layout in the '
+           'active document. Direction-agnostic: works for CD->building, '
+           'building->CD, and building->building (via Common Details as the '
+           'common coordinate space).')
 
 import json
 import sys
@@ -198,9 +197,11 @@ chosen_link = ui.pick_list(
     "1 of 5 — Reference Linked Model",
     button_name="Next",
     multiselect=False,
-    context=u"Pick 'None' if you're working inside Common Details (migrating custom "
-            u"details from a building into CD — the master_map auto-inverts). Pick the "
-            u"Common Details link if you're in a BUILDING importing content from CD."
+    context=u"Pick the Common Details link if you are IN a building (the link's "
+            u"transform converts JSON coordinates into building space). Pick "
+            u"'None' if THIS file IS Common Details — no transform needed, the "
+            u"JSON's coordinates are already CD-relative (master_map.json "
+            u"auto-inverts in this direction)."
 )
 if not chosen_link:
     script.exit()
@@ -355,9 +356,9 @@ DO_LINES      = any("Detail lines"              in o for o in chosen_sheet_opts)
 dest_prefix = ui.ask_for_string(
     prompt="Enter the 2-letter prefix of the destination model\n(e.g. AE, AB, AC...)",
     title="5 of 5 — Destination Model Prefix",
-    context=u"2-letter prefix of the destination building (AE/AB/AC/AD/AF/AG/AK/AS). "
-            u"If you're importing into Common Details itself, use 'CD'. The JSON's "
-            u"sheet names get rewritten with this prefix."
+    context=u"2-letter prefix used to rewrite the JSON's sheet names for this "
+            u"destination. Common building prefixes: AE, AB, AC, AD, AF, AG, AK; "
+            u"AS for Site. Use 'CD' when importing into Common Details itself."
 )
 if not dest_prefix:
     script.exit()

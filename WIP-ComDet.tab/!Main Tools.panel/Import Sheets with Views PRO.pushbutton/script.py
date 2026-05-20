@@ -1,10 +1,10 @@
 # -*- coding: utf-8 -*-
 __title__ = 'Import\nSheets with Views PRO'
-__doc__ = ('Batch version of Import Sheets with Views. Pick the JSON, master '
-           'views, strategy and sheet update options ONCE; then choose multiple '
-           'open documents and configure each one\'s prefix + link. The importer '
-           'runs back-to-back over every selected doc and produces a single '
-           'aggregated report.')
+__doc__ = ('Batch version of "Import Sheets with Views". Pick a JSON, choose '
+           'which sheets to bring, then select multiple open Revit documents '
+           '— the importer runs back-to-back on every doc with its own prefix '
+           'and link. Typical use: pushing a CD-generated JSON to all '
+           'building documents in one go.')
 
 import json
 import sys
@@ -322,9 +322,10 @@ chosen_doc_labels = ui.pick_list(
     "5 of 7 — Select Destination Documents",
     button_name="Next",
     context=u"Pick the open Revit docs you want to import into. The tool does "
-            u"NOT open files — they must already be loaded in this session. For "
-            u"each picked doc you'll be asked separately for its 2-letter prefix "
-            u"and the Common Details link inside that doc."
+            u"NOT open files — they must already be loaded in this Revit "
+            u"session. For each picked doc you'll be asked separately for its "
+            u"2-letter prefix and the Common Details link inside that doc "
+            u"(or 'None' if that doc IS CD itself)."
 )
 if not chosen_doc_labels:
     script.exit()
@@ -361,9 +362,10 @@ for target_doc in chosen_docs:
         "{} of 7 — Link — {}".format(step, target_doc.Title),
         button_name="Next",
         multiselect=False,
-        context=u"Pick the Common Details link inside this doc — its transform converts "
-                u"JSON coordinates into the building's space. Pick 'None' only if this "
-                u"doc IS Common Details (you're seeding/updating CD from a building JSON)."
+        context=u"Pick the Common Details link inside this specific doc — its "
+                u"transform converts JSON coordinates into this doc's space. "
+                u"Pick 'None' if this doc IS Common Details (you're seeding CD "
+                u"from a JSON, e.g. building->CD migration)."
     )
     if not link_choice:
         script.exit()

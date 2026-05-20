@@ -1,9 +1,11 @@
 # -*- coding: utf-8 -*-
 __title__ = 'Export\nSheets with Views'
-__doc__ = ('Exports dependent views and sheet layout together in a single JSON file. '
-           'Select the sheets, choose the Common Details linked model, and save. '
-           'The resulting file can be imported with "Import Sheets with Views" '
-           'to recreate both the views and the sheet layout in one step.')
+__doc__ = ('Bundles dependent views + sheet layout from this file into a single '
+           'JSON. The JSON can later be imported into any other Revit file (or '
+           'back into this one). Common Details is the coordinate hub — any '
+           'source/destination references CD via its linked instance, so '
+           'coordinates can be translated cleanly across the 4 directions: '
+           'CD->building, building->CD, building->building, CD->CD (round-trip).')
 
 import json
 import sys
@@ -69,11 +71,11 @@ chosen_link = ui.pick_list(
     "1 of 3 — Reference Linked Model",
     button_name="Next",
     multiselect=False,
-    context=u"Pick the Common Details link if you're exporting from a BUILDING — "
-            u"the tool uses its transform to convert the building's custom-detail "
-            u"coordinates into Common Details space. Pick 'None' if you're "
-            u"exporting from the Common Details file itself (no transform needed; "
-            u"coordinates are already in CD local space)."
+    context=u"Pick the Common Details link if this file is a BUILDING — its "
+            u"transform translates view geometry into Common Details space, so "
+            u"the JSON is portable to any destination (other buildings or CD "
+            u"itself). Pick 'None' if THIS file IS Common Details — coordinates "
+            u"are written as-is (no transform needed)."
 )
 if not chosen_link:
     script.exit()
@@ -107,10 +109,11 @@ chosen_options = ui.pick_list(
     sheet_options,
     "2 of 3 — Select Sheets",
     button_name="Next",
-    context=u"Tick the sheets in this building that hold custom details you want to "
-            u"migrate into Common Details. The export bundles BOTH the dependent views "
-            u"and the sheet layout into a single JSON — then you import it into Common "
-            u"Details with 'Import Sheets with Views'."
+    context=u"Pick which sheets to bundle into the JSON. Every dependent view "
+            u"placed on these sheets is captured (placed views are tagged for "
+            u"re-placement; any orphan dependents under the same masters are "
+            u"also captured, tagged unplaced). The result is one portable file "
+            u"that 'Import Sheets with Views' replays into any destination."
 )
 if not chosen_options:
     script.exit()
