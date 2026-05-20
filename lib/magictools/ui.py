@@ -199,7 +199,7 @@ _STYLES = """
 _TEMPLATE = """
 <Window xmlns="http://schemas.microsoft.com/winfx/2006/xaml/presentation"
         xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml"
-        Title="__WIN_TITLE__" Width="__WIN_W__" Height="__WIN_H__"
+        Title="__WIN_TITLE__" Width="__WIN_W__" __WIN_H_ATTR__
         WindowStartupLocation="CenterScreen"
         FontFamily="Segoe UI" FontSize="13"
         Background="#0D111A" Foreground="#E8EBF5"
@@ -211,7 +211,7 @@ __STYLES__
   <Grid>
     <Grid.RowDefinitions>
       <RowDefinition Height="3"/>
-      <RowDefinition Height="*"/>
+      <RowDefinition Height="__OUTER_ROW_H__"/>
     </Grid.RowDefinitions>
 
     <Border Grid.Row="0">
@@ -226,7 +226,7 @@ __STYLES__
     <Grid Grid.Row="1" Margin="24,18,24,18">
       <Grid.RowDefinitions>
         <RowDefinition Height="Auto"/>
-        <RowDefinition Height="*"/>
+        <RowDefinition Height="__BODY_ROW_H__"/>
         <RowDefinition Height="Auto"/>
       </Grid.RowDefinitions>
 
@@ -236,6 +236,11 @@ __STYLES__
                    FontSize="18" FontWeight="SemiBold" Foreground="#E8EBF5"/>
         <TextBlock x:Name="__noir_subtitle__"
                    FontSize="11" Foreground="#8088A8" Margin="0,3,0,0"/>
+        <TextBlock x:Name="__noir_context__"
+                   FontSize="12" Foreground="#8088A8"
+                   Margin="0,10,0,0"
+                   LineHeight="17"
+                   TextWrapping="Wrap"/>
       </StackPanel>
 
       <!-- Work surface (elevated card) -->
@@ -265,29 +270,54 @@ def _xml_esc(s):
 
 
 def build(title, subtitle, body, footer="", width=720, height=500):
-    """Return the full Noir window XAML string."""
+    """Return the full Noir window XAML string.
+
+    Pass height=None to let the window auto-size to its content
+    (sets SizeToContent="Height" and collapses the body row to Auto).
+    """
     safe_title = _xml_esc(title)
+    if height is None:
+        h_attr    = 'SizeToContent="Height" MinHeight="180"'
+        outer_row = 'Auto'
+        body_row  = 'Auto'
+    else:
+        h_attr    = 'Height="{}"'.format(height)
+        outer_row = '*'
+        body_row  = '*'
     return (_TEMPLATE
-            .replace("__WIN_TITLE__", safe_title)
-            .replace("__WIN_W__",     str(width))
-            .replace("__WIN_H__",     str(height))
-            .replace("__STYLES__",    _STYLES)
-            .replace("__BODY__",      body)
-            .replace("__FOOTER__",    footer))
+            .replace("__WIN_TITLE__",   safe_title)
+            .replace("__WIN_W__",       str(width))
+            .replace("__WIN_H_ATTR__",  h_attr)
+            .replace("__OUTER_ROW_H__", outer_row)
+            .replace("__BODY_ROW_H__",  body_row)
+            .replace("__STYLES__",      _STYLES)
+            .replace("__BODY__",        body)
+            .replace("__FOOTER__",      footer))
 
 
-def parse(title, subtitle, body, footer="", width=720, height=500):
-    """Build, parse, and return a WPF Window ready for wiring."""
+def parse(title, subtitle, body, footer="", width=720, height=None, context=""):
+    """Build, parse, and return a WPF Window ready for wiring.
+
+    ``context`` is an optional longer paragraph that renders below the
+    subtitle, explaining to the user what's being asked and why. Wraps
+    to multiple lines automatically. Pass "" (default) to hide the block.
+    """
     xaml = build(title, subtitle, body, footer, width, height)
     win = XamlReader.Parse(xaml)
     win.FindName("__noir_title__").Text = title
     win.FindName("__noir_subtitle__").Text = subtitle
+    ctx_tb = win.FindName("__noir_context__")
+    if context:
+        ctx_tb.Text = context
+    else:
+        ctx_tb.Visibility = Visibility.Collapsed
     return win
 
 
-def show(title, subtitle, body, footer="", width=720, height=500):
+def show(title, subtitle, body, footer="", width=720, height=None, context=""):
     """Build, parse, and ShowDialog."""
-    return parse(title, subtitle, body, footer, width, height).ShowDialog()
+    return parse(title, subtitle, body, footer, width, height,
+                 context=context).ShowDialog()
 
 
 # ── Reusable Noir dialogs ────────────────────────────────────────────────────
@@ -353,7 +383,8 @@ class _PickItem(object):
 
 
 def pick_list(items, title, subtitle="", button_name="OK",
-              multiselect=True, width=480, height=460, name_fn=None):
+              multiselect=True, width=480, height=460, name_fn=None,
+              context=""):
     """Show a Noir list picker.
 
     Args:
@@ -373,7 +404,7 @@ def pick_list(items, title, subtitle="", button_name="OK",
     mode = "Extended" if multiselect else "Single"
     body = _PICK_BODY.replace('SelectionMode="Extended"', 'SelectionMode="{}"'.format(mode))
 
-    win = parse(title, subtitle, body, footer, width, height)
+    win = parse(title, subtitle, body, footer, width, height, context=context)
     grid      = win.FindName("grid")
     txtFilter = win.FindName("txtFilter")
     lblCount  = win.FindName("lblCount")
@@ -444,9 +475,10 @@ def pick_list(items, title, subtitle="", button_name="OK",
     return state['result']
 
 
-def alert(message, title="Alert", width=440, height=240):
+def alert(message, title="Alert", width=440, height=None, context=""):
     """Show a Noir alert dialog."""
-    win = parse(title, "", _ALERT_BODY, _ALERT_FOOTER, width, height)
+    win = parse(title, "", _ALERT_BODY, _ALERT_FOOTER, width, height,
+                context=context)
     win.FindName("lblMsg").Text = message
     win.FindName("btnOK").Click += lambda s, e: win.Close()
     win.ShowDialog()
@@ -475,9 +507,10 @@ _INPUT_FOOTER = """
 
 
 def ask_for_string(prompt="", title="Input", default="",
-                   width=440, height=220):
+                   width=440, height=None, context=""):
     """Show a Noir text-input dialog. Returns string or None on cancel."""
-    win = parse(title, "", _INPUT_BODY, _INPUT_FOOTER, width, height)
+    win = parse(title, "", _INPUT_BODY, _INPUT_FOOTER, width, height,
+                context=context)
     win.FindName("lblPrompt").Text = prompt
     txt = win.FindName("txtInput")
     txt.Text = default
@@ -496,10 +529,11 @@ def ask_for_string(prompt="", title="Input", default="",
 
 
 def confirm(message, title="Confirm", yes_text="Continue",
-            width=500, height=280):
+            width=500, height=None, context=""):
     """Show a Noir confirmation dialog. Returns True if confirmed."""
     footer = _CONFIRM_FOOTER.replace("__YES__", _xml_esc(yes_text))
-    win = parse(title, "", _ALERT_BODY, footer, width, height)
+    win = parse(title, "", _ALERT_BODY, footer, width, height,
+                context=context)
     win.FindName("lblMsg").Text = message
     state = {'ok': False}
 
@@ -511,3 +545,117 @@ def confirm(message, title="Confirm", yes_text="Continue",
     win.FindName("btnNo").Click  += lambda s, e: win.Close()
     win.ShowDialog()
     return state['ok']
+
+
+# ── Report window ─────────────────────────────────────────────────────────────
+
+_REPORT_BODY = """
+  <Grid>
+    <TextBox x:Name="txtReport"
+             IsReadOnly="True" TextWrapping="Wrap"
+             VerticalScrollBarVisibility="Auto"
+             HorizontalScrollBarVisibility="Disabled"
+             FontFamily="Consolas" FontSize="12"
+             Background="Transparent" Foreground="#E8EBF5"
+             BorderThickness="0" Padding="2"/>
+  </Grid>
+"""
+
+_REPORT_FOOTER = """
+  <Grid>
+    <TextBlock x:Name="lblSummary" VerticalAlignment="Center" Foreground="#5A6286"/>
+    <StackPanel HorizontalAlignment="Right" Orientation="Horizontal">
+      <Button x:Name="btnCopy"  Content="Copy to Clipboard" Style="{StaticResource BtnGhost}" Margin="0,0,8,0"/>
+      <Button x:Name="btnClose" Content="Close"             Style="{StaticResource BtnPrimary}"/>
+    </StackPanel>
+  </Grid>
+"""
+
+
+def show_report(text, title="Report", subtitle="", summary="",
+                width=680, height=560, context=""):
+    """Show a scrollable read-only Noir window with a Copy to Clipboard button.
+
+    Args:
+        text:     Plain-text content to display (unicode string).
+        title:    Window title (shown in header).
+        subtitle: Smaller line below title.
+        summary:  Short stats string shown on the left of the footer
+                  (e.g. "✅ 12  ⚠ 3  ❌ 0").
+        width:    Window width in px (default 680).
+        height:   Window height in px (default 560). Fixed — the body scrolls.
+    """
+    from System.Windows import Clipboard
+    win = parse(title, subtitle, _REPORT_BODY, _REPORT_FOOTER, width, height,
+                context=context)
+    win.FindName("txtReport").Text = text
+    win.FindName("lblSummary").Text = summary
+
+    def on_copy(s, e):
+        try:
+            Clipboard.SetText(text)
+        except Exception:
+            pass
+
+    win.FindName("btnCopy").Click  += on_copy
+    win.FindName("btnClose").Click += lambda s, e: win.Close()
+    win.ShowDialog()
+
+
+# ── Progress bar ──────────────────────────────────────────────────────────────
+
+class ProgressBar(object):
+    """Bottom-anchored pyRevit progress bar — standard for Magic Tools / Toolcraft.
+
+    Wraps pyrevit.forms.ProgressBar and repositions the window to the bottom
+    edge of the Revit window (clamped to the screen working area so it never
+    slips behind the taskbar).
+
+    Usage (identical to forms.ProgressBar):
+
+        from magictools import ui
+
+        with ui.ProgressBar(title="My Tool", cancellable=True) as pb:
+            for i, item in enumerate(items):
+                if pb.cancelled:
+                    break
+                pb.title = u"My Tool — {}/{} — {}".format(i+1, n, item.Name)
+                # ... process ...
+                pb.update_progress(i + 1, n)
+
+    Returns (results, n_total, was_cancelled) is the recommended function
+    signature for batch-scan functions — see pattern_progress_bar.md.
+    """
+
+    def __new__(cls, *args, **kwargs):
+        from pyrevit import forms, HOST_APP
+        from pyrevit import revit as _pvr
+
+        class _BottomProgressBar(forms.ProgressBar):
+            def update_window(self):
+                # Reimplements TemplatePromptBar.update_window() entirely so the
+                # window is positioned at the BOTTOM in one step, never at top.
+                # Calling super() first would flash the window to the top before
+                # we moved it down, causing visible flicker on every update.
+                try:
+                    screen_area = HOST_APP.proc_screen_workarea
+                    window_rect = _pvr.ui.get_window_rectangle()
+                    scale = 1.0 / HOST_APP.proc_screen_scalefactor
+
+                    width = window_rect.Right - window_rect.Left
+                    left  = window_rect.Left
+                    left_diff = abs(screen_area.Left - left)
+                    if 10 > left_diff > 0 and left_diff < width:
+                        width -= left_diff * 2
+                        left = screen_area.Left
+
+                    bottom = min(window_rect.Bottom, screen_area.Bottom)
+
+                    self.Top    = (bottom - self.user_height) * scale
+                    self.Left   = left  * scale
+                    self.Width  = width * scale
+                    self.Height = self.user_height
+                except Exception:
+                    super(_BottomProgressBar, self).update_window()  # fallback: top
+
+        return _BottomProgressBar(*args, **kwargs)

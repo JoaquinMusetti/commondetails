@@ -15,8 +15,8 @@ while _ext_dir and not _ext_dir.endswith('.extension'):
 sys.path.append(_os.path.join(_ext_dir, 'lib'))
 from magictools import ui
 
-doc    = revit.doc
-output = script.get_output()
+doc = revit.doc
+SEP = u"─" * 55
 
 # ─────────────────────────────────────────────────────────────────────────────
 # 1. Collect all sheets
@@ -40,7 +40,10 @@ chosen_ref = ui.pick_list(
     sheet_options,
     "Select Reference Sheet",
     button_name="Next",
-    multiselect=False
+    multiselect=False,
+    context=u"Reference sheet: the tool reads the exact position of the titleblock "
+            u"on this sheet and uses it as the target position for all the other "
+            u"sheets you'll pick next."
 )
 if not chosen_ref:
     script.exit()
@@ -65,33 +68,36 @@ ref_type_id  = ref_tb.GetTypeId()
 ref_type     = doc.GetElement(ref_type_id)
 ref_tb_family_name = ref_type.FamilyName if ref_type else ""
 
-output.print_md("**Reference sheet:** `{} - {}`".format(
-    ref_sheet.SheetNumber, ref_sheet.Name))
-output.print_md("**Reference titleblock:** `{}`".format(ref_tb_family_name))
-output.print_md("**Reference position:** X={:.4f}  Y={:.4f}".format(
-    ref_location.X, ref_location.Y))
-
 # ─────────────────────────────────────────────────────────────────────────────
 # 3. Pick sheets to align
 # ─────────────────────────────────────────────────────────────────────────────
 
-# Remove reference sheet from options
 target_options = [o for o in sheet_options if o != chosen_ref]
 
 chosen_targets = ui.pick_list(
     target_options,
     "Select Sheets to Align",
-    button_name="Align"
+    button_name="Align",
+    context=u"Sheets to align. The titleblock on each one will be moved to match "
+            u"the position of the reference sheet's titleblock. Useful after "
+            u"importing sheets from a JSON, where titleblocks may end up offset."
 )
 if not chosen_targets:
     script.exit()
 
 target_sheets = [sheet_by_option[o] for o in chosen_targets]
-output.print_md("**Sheets to align:** {}".format(len(target_sheets)))
 
 # ─────────────────────────────────────────────────────────────────────────────
 # 4. Align titleblocks
 # ─────────────────────────────────────────────────────────────────────────────
+
+lines = []
+lines.append(u"Reference: {} - {}".format(ref_sheet.SheetNumber, ref_sheet.Name))
+lines.append(u"Titleblock: {}".format(ref_tb_family_name))
+lines.append(u"Position: X={:.4f}  Y={:.4f}".format(ref_location.X, ref_location.Y))
+lines.append(u"Sheets to align: {}".format(len(target_sheets)))
+lines.append(u"")
+lines.append(SEP)
 
 moved   = 0
 skipped = 0
@@ -106,7 +112,7 @@ with revit.Transaction("Align Titleblocks"):
                 .ToElements())
 
             if not tbs:
-                output.print_md("  ⚠️ No titleblock on sheet {} - {}".format(
+                lines.append(u"  ⚠  No titleblock: {} - {}".format(
                     sheet.SheetNumber, sheet.Name))
                 skipped += 1
                 continue
@@ -116,7 +122,7 @@ with revit.Transaction("Align Titleblocks"):
 
             if (abs(curr_loc.X - ref_location.X) < 1e-6 and
                     abs(curr_loc.Y - ref_location.Y) < 1e-6):
-                output.print_md("  ⏭️ Already aligned: {} - {}".format(
+                lines.append(u"  ⏭  Already aligned: {} - {}".format(
                     sheet.SheetNumber, sheet.Name))
                 skipped += 1
                 continue
@@ -127,23 +133,31 @@ with revit.Transaction("Align Titleblocks"):
                 0
             )
             tb.Location.Move(delta)
-            output.print_md("  ✅ Aligned: {} - {}  (moved {:.4f}, {:.4f})".format(
+            lines.append(u"  ✅ Aligned: {} - {}  (moved {:.4f}, {:.4f})".format(
                 sheet.SheetNumber, sheet.Name, delta.X, delta.Y))
             moved += 1
 
         except Exception as e:
-            errors.append("{} - {}: {}".format(sheet.SheetNumber, sheet.Name, str(e)))
-            output.print_md("  ❌ Error: {} - {}".format(sheet.SheetNumber, sheet.Name))
+            errors.append(u"{} - {}: {}".format(sheet.SheetNumber, sheet.Name, str(e)))
+            lines.append(u"  ❌ Error: {} - {}".format(sheet.SheetNumber, sheet.Name))
 
 # ─────────────────────────────────────────────────────────────────────────────
 # 5. Report
 # ─────────────────────────────────────────────────────────────────────────────
 
-output.print_md("\n---")
-output.print_md("✅ **{}** titleblocks aligned".format(moved))
-output.print_md("⏭️ **{}** already correct, skipped".format(skipped))
+lines.append(u"")
+lines.append(SEP)
+lines.append(u"✅  {} titleblocks aligned".format(moved))
+lines.append(u"⏭️  {} already correct, skipped".format(skipped))
 
 if errors:
-    output.print_md("❌ **{} errors:**".format(len(errors)))
+    lines.append(u"❌  {} error(s):".format(len(errors)))
     for e in errors:
-        output.print_md("  - {}".format(e))
+        lines.append(u"  - {}".format(e))
+
+ui.show_report(
+    text     = u"\n".join(lines),
+    title    = u"Align Titleblocks",
+    subtitle = u"Reference: {} - {}".format(ref_sheet.SheetNumber, ref_sheet.Name),
+    summary  = u"✅ {}  ⏭️ {}  ❌ {}".format(moved, skipped, len(errors)),
+)

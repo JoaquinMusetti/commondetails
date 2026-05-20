@@ -117,7 +117,11 @@ chosen = ui.pick_list(
     sorted(all_styles.keys()),
     "Select Line Style",
     button_name="Create Lines",
-    multiselect=False
+    multiselect=False,
+    context=u"Line style used to draw the crop box rectangles. The tool reads the "
+            u"crop box of each selected dependent view and draws 4 detail lines of "
+            u"this style forming the rectangle in the parent view. Useful for "
+            u"visualizing crops on the master view."
 )
 if not chosen:
     script.exit()

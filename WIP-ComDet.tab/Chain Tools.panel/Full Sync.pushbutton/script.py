@@ -59,7 +59,11 @@ chosen_link   = ui.pick_list(
     sorted(link_by_name.keys()),
     "3 of 5 - Reference Linked Model",
     button_name="Next",
-    multiselect=False
+    multiselect=False,
+    context=u"Full Sync runs Import/Sync Views + Import Sheet Layout + Align "
+            u"Titleblocks back-to-back, with no pauses once confirmed. Pick the "
+            u"Common Details link here — its transform is used to convert JSON "
+            u"coordinates into this building's space."
 )
 if not chosen_link:
     script.exit()
@@ -70,7 +74,10 @@ link_type      = doc.GetElement(link_instance.GetTypeId())  # RevitLinkType for 
 
 dest_prefix = ui.ask_for_string(
     prompt="Enter the 2-letter prefix of the destination model\n(e.g. AE, AB, AC...)",
-    title="4 of 5 - Destination Model Prefix"
+    title="4 of 5 - Destination Model Prefix",
+    context=u"2-letter prefix of the destination building "
+            u"(AE/AB/AC/AD/AF/AG/AK/AS). Used to rewrite sheet names from "
+            u"'CD_XXXX_...' to '<prefix>_XXXX_...'."
 )
 if not dest_prefix:
     script.exit()
@@ -80,7 +87,10 @@ master_options = sorted([mv["view_name"] for mv in views_data["master_views"]])
 chosen_masters = ui.pick_list(
     master_options,
     "5 of 5 - Select Master Views",
-    button_name="Sync"
+    button_name="Sync",
+    context=u"Final step before the sync runs: tick which masters from the JSON "
+            u"to bring over. Dependents of unticked masters are skipped entirely. "
+            u"After this you'll see a confirmation summary — last chance to abort."
 )
 if not chosen_masters:
     script.exit()

@@ -2,7 +2,7 @@
 __title__ = 'Set Title\nOn Sheet'
 __doc__ = """Sets the Title on Sheet parameter for dependent views based on their view name.
 
-If the view name starts with a numeric prefix (##_), 
+If the view name starts with a numeric prefix (##_),
 the title on sheet is set to the view name without the first 3 characters.
 Example: 05_BACKING DETAILS AT PIPES -> BACKING DETAILS AT PIPES
 
@@ -23,8 +23,8 @@ while _ext_dir and not _ext_dir.endswith('.extension'):
 sys.path.append(_os.path.join(_ext_dir, 'lib'))
 from magictools import ui
 
-doc    = revit.doc
-output = script.get_output()
+doc = revit.doc
+SEP = u"─" * 55
 
 # ─────────────────────────────────────────────────────────────────────────────
 # 1. Select master views
@@ -54,7 +54,11 @@ for v in master_views:
 chosen = ui.pick_list(
     [v.Name for v in master_views],
     "Select Master Views",
-    button_name="Set Titles"
+    button_name="Set Titles",
+    context=u"Tick the masters whose dependents you want to affect. The tool reads "
+            u"the numeric prefix of each dependent's name (e.g. '01_PoolDeck' → '01') "
+            u"and stamps it into 'Title on Sheet'. Views without a numeric prefix "
+            u"are left alone."
 )
 if not chosen:
     script.exit()
@@ -78,17 +82,19 @@ def strip_prefix(name):
 # 3. Process dependent views
 # ─────────────────────────────────────────────────────────────────────────────
 
-updated  = 0
-skipped  = 0
-errors   = []
+lines   = []
+updated = 0
+skipped = 0
+errors  = []
 
 with revit.Transaction("Set Title On Sheet"):
     for master_view in selected_views:
-        output.print_md("### {}".format(master_view.Name))
+        lines.append(u"")
+        lines.append(u"{}".format(master_view.Name))
 
         dep_ids = master_view.GetDependentViewIds()
         if not dep_ids:
-            output.print_md("  *(no dependent views)*")
+            lines.append(u"  (no dependent views)")
             continue
 
         for vid in dep_ids:
@@ -105,31 +111,35 @@ with revit.Transaction("Set Title On Sheet"):
                         current = p.AsString() or ""
                         if current != new_title:
                             p.Set(new_title)
-                            output.print_md("  ✅ *{}*  →  `{}`".format(
-                                view_name, new_title))
+                            lines.append(u"  ✅ {}  →  {}".format(view_name, new_title))
                         else:
-                            output.print_md("  ✔ *{}*  already set, no change".format(
-                                view_name))
+                            lines.append(u"  ✔  {} already set, no change".format(view_name))
                         updated += 1
                     else:
-                        output.print_md("  ⚠️ *{}*  parameter is read-only".format(
-                            view_name))
+                        lines.append(u"  ⚠  {} — parameter is read-only".format(view_name))
                 else:
-                    output.print_md("  ⏭️ *{}*  no prefix, skipped".format(view_name))
+                    lines.append(u"  ⏭  {} — no prefix, skipped".format(view_name))
                     skipped += 1
 
             except Exception as e:
-                errors.append("*{}*: {}".format(dep.Name, str(e)))
+                errors.append(u"{}: {}".format(dep.Name, str(e)))
 
 # ─────────────────────────────────────────────────────────────────────────────
 # 4. Report
 # ─────────────────────────────────────────────────────────────────────────────
 
-output.print_md("\n---")
-output.print_md("✅ **{}** updated  |  ⏭️ **{}** skipped (no prefix)".format(
-    updated, skipped))
+lines.append(u"")
+lines.append(SEP)
+lines.append(u"✅  {} updated  |  ⏭️  {} skipped (no prefix)".format(updated, skipped))
 
 if errors:
-    output.print_md("❌ **{} errors:**".format(len(errors)))
+    lines.append(u"❌  {} error(s):".format(len(errors)))
     for e in errors:
-        output.print_md("  - {}".format(e))
+        lines.append(u"  - {}".format(e))
+
+ui.show_report(
+    text     = u"\n".join(lines),
+    title    = u"Set Title On Sheet",
+    subtitle = u"{} master view(s) processed".format(len(selected_views)),
+    summary  = u"✅ {} updated  ⏭️ {} skipped".format(updated, skipped),
+)

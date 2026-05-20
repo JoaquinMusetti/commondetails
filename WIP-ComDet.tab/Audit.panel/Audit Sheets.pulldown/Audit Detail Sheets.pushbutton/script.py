@@ -16,8 +16,9 @@ sys.path.append(_os.path.join(
 ))
 from magictools import ui
 
-doc    = revit.doc
-output = script.get_output()
+doc = revit.doc
+
+SEP = u"─" * 55   # ───────────────────────────────────────────────────────
 
 # ─────────────────────────────────────────────────────────────────────────────
 # 1. Pick JSON file
@@ -33,27 +34,34 @@ if not json_path:
 with open(json_path, "r") as f:
     layout = json.load(f)
 
-output.print_md("**Sheets in JSON:** {}".format(len(layout)))
+lines = []
+lines.append(u"Sheets in JSON: {}".format(len(layout)))
 
 # ─────────────────────────────────────────────────────────────────────────────
 # 2. Destination model prefix
 # ─────────────────────────────────────────────────────────────────────────────
 
 dest_prefix = ui.ask_for_string(
-    prompt="Enter the 2-letter prefix of the destination model\n(e.g. AE, AB, AC...)",
+    prompt="Sheets in JSON: {}\n\nEnter the 2-letter prefix of the destination model\n(e.g. AE, AB, AC...)".format(len(layout)),
     title="Audit Sheet Layout",
+    context=u"Audits the sheet layout of the active model against the JSON. "
+            u"Reports viewports out of position, mismatched detail numbers, "
+            u"different titleblock types, and orphan sheets. The prefix is used "
+            u"to match sheet names against the JSON (whose names carry the 'CD' "
+            u"prefix)."
 )
 if not dest_prefix:
     script.exit()
 
 dest_prefix = dest_prefix.strip().upper()
-output.print_md("**Destination prefix:** `{}`".format(dest_prefix))
+lines.append(u"Destination prefix: {}".format(dest_prefix))
 
 # ─────────────────────────────────────────────────────────────────────────────
 # 3. Index destination model resources
 # ─────────────────────────────────────────────────────────────────────────────
 
-output.print_md("Indexing model resources...")
+lines.append(u"")
+lines.append(u"Indexing model resources...")
 
 all_views = DB.FilteredElementCollector(doc).OfClass(DB.View).ToElements()
 dep_view_by_name = {}
@@ -90,7 +98,6 @@ all_vp_types = DB.FilteredElementCollector(doc)\
     .ToElements()
 for t in all_vp_types:
     try:
-        # Only keep Viewport family types
         if t.FamilyName == "Viewport":
             vp_type_by_name[t.Name] = t
     except Exception:
@@ -109,16 +116,18 @@ for vp in all_viewports:
     except Exception:
         pass
 
-output.print_md("**Dependent views indexed:** {}".format(len(dep_view_by_name)))
-output.print_md("**Sheets indexed:** {}".format(len(sheet_by_suffix)))
-output.print_md("**Viewport types in model:** {}".format(len(vp_type_by_name)))
+lines.append(u"  Dependent views : {}".format(len(dep_view_by_name)))
+lines.append(u"  Sheets          : {}".format(len(sheet_by_suffix)))
+lines.append(u"  Viewport types  : {}".format(len(vp_type_by_name)))
 
 # ─────────────────────────────────────────────────────────────────────────────
 # 4. Pre-audit: check for missing viewport types
 # ─────────────────────────────────────────────────────────────────────────────
 
-output.print_md("\n---")
-output.print_md("## 🔍 Pre-Audit: Viewport Types")
+lines.append(u"")
+lines.append(SEP)
+lines.append(u"Pre-Audit: Viewport Types")
+lines.append(SEP)
 
 json_vp_types = set()
 for sheet_data in layout:
@@ -130,18 +139,13 @@ for sheet_data in layout:
 missing_types = sorted([t for t in json_vp_types if t not in vp_type_by_name])
 
 if not missing_types:
-    output.print_md("✅ All viewport types referenced in JSON are present in this model.")
+    lines.append(u"✅  All viewport types present in this model.")
 else:
-    output.print_md(
-        "⚠️  **{} viewport type(s) referenced in JSON are NOT in this model:**".format(
-            len(missing_types))
-    )
+    lines.append(u"⚠   {} viewport type(s) NOT in this model:".format(len(missing_types)))
     for mt in missing_types:
-        output.print_md("  - `{}`".format(mt))
-    output.print_md(
-        "\n> **Action required before importing:** Transfer these types from the source "
-        "model using **Manage → Transfer Project Standards → Viewport Types**."
-    )
+        lines.append(u"    - {}".format(mt))
+    lines.append(u"")
+    lines.append(u"  Action: Transfer via Manage > Transfer Project Standards > Viewport Types")
     ui.alert(
         "{} viewport type(s) from the JSON are missing in this model:\n\n{}\n\n"
         "Transfer them from the source model via:\n"
@@ -192,7 +196,10 @@ def get_viewport_type_name(vp):
 # 6. Audit
 # ─────────────────────────────────────────────────────────────────────────────
 
-output.print_md("\n---")
+lines.append(u"")
+lines.append(SEP)
+lines.append(u"Audit Results")
+lines.append(SEP)
 
 sheets_not_found    = []
 sheets_with_issues  = []
@@ -224,8 +231,8 @@ for sheet_data in layout:
     for vp in sheet_vps:
         vname = get_view_name_from_vp(vp)
         if vname:
-            v_elem     = doc.GetElement(vp.ViewId)
-            view_type  = str(v_elem.ViewType) if v_elem else ""
+            v_elem    = doc.GetElement(vp.ViewId)
+            view_type = str(v_elem.ViewType) if v_elem else ""
             model_vp_dict[vname] = (
                 vp, get_detail_number(vp), get_viewport_type_name(vp), view_type)
 
@@ -234,7 +241,7 @@ for sheet_data in layout:
     # Views in JSON not found in model
     for vname in json_vp_dict:
         if vname not in dep_view_by_name:
-            issues.append("🔴 **NOT IN MODEL** — *{}* (renamed or deleted)".format(vname))
+            issues.append(u"\U0001f534 NOT IN MODEL — {} (renamed or deleted)".format(vname))
 
     # Views in JSON not placed in this sheet
     for vname in json_vp_dict:
@@ -242,8 +249,7 @@ for sheet_data in layout:
             target_view = dep_view_by_name[vname]
             vid = target_view.Id.IntegerValue
             if vid not in viewport_by_view_id:
-                issues.append("➕ **NOT PLACED** — *{}* (exists in model but not on sheet)".format(
-                    vname))
+                issues.append(u"➕ NOT PLACED — {} (exists but not on sheet)".format(vname))
 
     # Orphaned viewports — on sheet but NOT in JSON
     for vname, (vp, det_num, type_name, _view_type) in model_vp_dict.items():
@@ -256,9 +262,7 @@ for sheet_data in layout:
             except Exception:
                 pass
             if is_dependent:
-                issues.append(
-                    "⚠️  **ORPHANED** — *{}* (on sheet, not in JSON — will cause conflicts)".format(
-                        vname))
+                issues.append(u"⚠  ORPHANED — {} (on sheet, not in JSON)".format(vname))
                 all_orphaned_vp_ids.append(vp.Id)
                 orphaned_details.append((dest_sheet_number, vname))
 
@@ -269,7 +273,7 @@ for sheet_data in layout:
             model_det_num = model_vp_dict[vname][1]
             if json_det_num and model_det_num and json_det_num != model_det_num:
                 issues.append(
-                    "🔢 **DETAIL NUMBER MISMATCH** — *{}*  JSON: `{}`  Model: `{}`".format(
+                    u"\U0001f522 DETAIL NUMBER MISMATCH — {}  JSON: {}  Model: {}".format(
                         vname, json_det_num, model_det_num))
 
     # Viewport type mismatches
@@ -279,11 +283,11 @@ for sheet_data in layout:
             model_type = model_vp_dict[vname][2]
             if json_type and model_type and json_type != model_type:
                 issues.append(
-                    "🖼️  **VIEWPORT TYPE MISMATCH** — *{}*  JSON: `{}`  Model: `{}`".format(
+                    u"\U0001f5bc  VIEWPORT TYPE MISMATCH — {}  JSON: {}  Model: {}".format(
                         vname, json_type, model_type))
             elif json_type and not model_type:
                 issues.append(
-                    "🖼️  **VIEWPORT TYPE UNKNOWN** — *{}*  expected: `{}`".format(
+                    u"\U0001f5bc  VIEWPORT TYPE UNKNOWN — {}  expected: {}".format(
                         vname, json_type))
 
     # View type mismatches (e.g. Section changed to FloorPlan)
@@ -293,50 +297,54 @@ for sheet_data in layout:
             model_view_type = model_vp_dict[vname][3]
             if model_view_type and model_view_type != json_view_type:
                 issues.append(
-                    "🔄 **VIEW TYPE MISMATCH** — *{}*  JSON: `{}`  Model: `{}`  "
-                    "— delete and re-import".format(
+                    u"\U0001f504 VIEW TYPE MISMATCH — {}  JSON: {}  Model: {}  (delete & re-import)".format(
                         vname, json_view_type, model_view_type))
 
     if issues:
-        output.print_md("### ⚠️  Sheet {}  —  {}".format(dest_sheet_number, sheet_name))
+        lines.append(u"⚠   {} — {}".format(dest_sheet_number, sheet_name))
         for issue in issues:
-            output.print_md("  {}".format(issue))
+            lines.append(u"    {}".format(issue))
         sheets_with_issues.append(dest_sheet_number)
     else:
-        output.print_md("### ✅ Sheet {}  —  {}".format(dest_sheet_number, sheet_name))
+        lines.append(u"✅  {} — {}".format(dest_sheet_number, sheet_name))
         sheets_ok.append(dest_sheet_number)
 
 # ─────────────────────────────────────────────────────────────────────────────
-# 7. Final summary
+# 7. Summary
 # ─────────────────────────────────────────────────────────────────────────────
 
-output.print_md("\n---")
-output.print_md("## Summary")
-output.print_md("✅ **{}** sheets in sync".format(len(sheets_ok)))
-output.print_md("⚠️  **{}** sheets with issues".format(len(sheets_with_issues)))
-output.print_md("❌ **{}** sheets not found in model".format(len(sheets_not_found)))
+lines.append(u"")
+lines.append(SEP)
+lines.append(u"SUMMARY")
+lines.append(SEP)
+lines.append(u"✅  {} sheets in sync".format(len(sheets_ok)))
+lines.append(u"⚠   {} sheets with issues".format(len(sheets_with_issues)))
+lines.append(u"❌  {} sheets not found in model".format(len(sheets_not_found)))
 
 if sheets_not_found:
-    output.print_md("\n**Sheets not found:**")
+    lines.append(u"")
+    lines.append(u"Sheets not found:")
     for s in sheets_not_found:
-        output.print_md("  - {}".format(s))
+        lines.append(u"  - {}".format(s))
 
 if sheets_with_issues:
-    output.print_md("\n**Sheets to address before importing:**")
+    lines.append(u"")
+    lines.append(u"Sheets to address before importing:")
     for s in sheets_with_issues:
-        output.print_md("  - {}".format(s))
+        lines.append(u"  - {}".format(s))
 
 if all_orphaned_vp_ids:
-    output.print_md("\n**Orphaned viewports (not in JSON — will cause conflicts):**")
+    lines.append(u"")
+    lines.append(u"Orphaned viewports:")
     current_sheet = None
     for sheet_num, vname in orphaned_details:
         if sheet_num != current_sheet:
-            output.print_md("  **{}**".format(sheet_num))
+            lines.append(u"  {}".format(sheet_num))
             current_sheet = sheet_num
-        output.print_md("    ⚠️  *{}*".format(vname))
+        lines.append(u"    ⚠  {}".format(vname))
 
 # ─────────────────────────────────────────────────────────────────────────────
-# 8. Handle orphaned viewports
+# 8. Handle orphaned viewports (interactive — before showing report)
 # ─────────────────────────────────────────────────────────────────────────────
 
 if all_orphaned_vp_ids:
@@ -349,6 +357,11 @@ if all_orphaned_vp_ids:
         "What do you want to do?".format(len(all_orphaned_vp_ids)),
     )
 
+    lines.append(u"")
+    lines.append(SEP)
+    lines.append(u"Orphaned Viewports — Action Taken")
+    lines.append(SEP)
+
     if action == "Remove from sheets (keep views)":
         removed = 0
         failed  = 0
@@ -359,9 +372,9 @@ if all_orphaned_vp_ids:
                     removed += 1
                 except Exception:
                     failed += 1
-        output.print_md("📌 **{}** viewports removed from sheets.".format(removed))
+        lines.append(u"\U0001f4cc {} viewports removed from sheets.".format(removed))
         if failed:
-            output.print_md("❌ **{}** could not be removed.".format(failed))
+            lines.append(u"❌ {} could not be removed.".format(failed))
 
     elif action == "Delete viewports":
         deleted = 0
@@ -373,9 +386,24 @@ if all_orphaned_vp_ids:
                     deleted += 1
                 except Exception:
                     failed += 1
-        output.print_md("🗑️ **{}** viewports deleted.".format(deleted))
+        lines.append(u"\U0001f5d1 {} viewports deleted.".format(deleted))
         if failed:
-            output.print_md("❌ **{}** could not be deleted.".format(failed))
+            lines.append(u"❌ {} could not be deleted.".format(failed))
 
     else:
-        output.print_md("⏭️ Orphaned viewports kept — address manually.")
+        lines.append(u"⏭ Orphaned viewports kept — address manually.")
+
+# ─────────────────────────────────────────────────────────────────────────────
+# 9. Show result window
+# ─────────────────────────────────────────────────────────────────────────────
+
+n_ok      = len(sheets_ok)
+n_issues  = len(sheets_with_issues)
+n_missing = len(sheets_not_found)
+
+ui.show_report(
+    text     = u"\n".join(lines),
+    title    = u"Audit Sheet Layout",
+    subtitle = u"{} sheets checked  —  prefix {}".format(len(layout), dest_prefix),
+    summary  = u"✅ {}   ⚠ {}   ❌ {}".format(n_ok, n_issues, n_missing),
+)

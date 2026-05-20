@@ -1,0 +1,19 @@
+# Python
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+.Python
+
+# pyRevit
+*.log
+
+# IDE
+.vscode/
+.idea/
+*.swp
+
+# OS junk
+Thumbs.db
+.DS_Store
+desktop.ini

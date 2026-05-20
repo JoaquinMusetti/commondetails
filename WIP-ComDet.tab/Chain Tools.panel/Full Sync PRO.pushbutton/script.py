@@ -55,7 +55,11 @@ master_options = sorted([mv["view_name"] for mv in views_data["master_views"]])
 chosen_masters = ui.pick_list(
     master_options,
     "3 - Select Master Views",
-    button_name="Next"
+    button_name="Next",
+    context=u"Full Sync PRO runs Full Sync on multiple buildings in one go. You pick "
+            u"the JSONs ONCE, then pick the destination docs (must be open in this "
+            u"Revit session) and configure their prefix + link. The masters you tick "
+            u"here apply to all docs equally."
 )
 if not chosen_masters:
     script.exit()
@@ -97,7 +101,11 @@ doc_labels = sorted([d.Title for d in all_open_docs])
 chosen_doc_labels = ui.pick_list(
     doc_labels,
     "4 - Select Documents to Sync",
-    button_name="Next"
+    button_name="Next",
+    context=u"Pick the open Revit docs you want to sync. The tool does NOT open "
+            u"files — they must be loaded in this session already. For each picked "
+            u"doc you'll be asked separately for its 2-letter prefix and its "
+            u"Common Details link."
 )
 if not chosen_doc_labels:
     script.exit()
@@ -113,7 +121,9 @@ for target_doc in chosen_docs:
     prefix = ui.ask_for_string(
         prompt="Enter the 2-letter prefix for:\n\n  {}\n\n(e.g. AE, AB, AC...)".format(
             target_doc.Title),
-        title="Prefix - {}".format(target_doc.Title)
+        title="Prefix - {}".format(target_doc.Title),
+        context=u"2-letter prefix used to rewrite sheet names for this specific "
+                u"building (AE/AB/AC/AD/AF/AG/AK/AS). Asked once per selected doc."
     )
     if not prefix:
         script.exit()
@@ -132,7 +142,11 @@ for target_doc in chosen_docs:
         sorted(link_by_name.keys()),
         "Linked Model - {}".format(target_doc.Title),
         button_name="Select",
-        multiselect=False
+        multiselect=False,
+        context=u"Pick the Common Details link inside this specific document. "
+                u"The link name may not be identical across buildings — that's why "
+                u"this picker is per-doc. Its transform converts JSON coordinates "
+                u"into the building's space."
     )
     if not link_name:
         script.exit()

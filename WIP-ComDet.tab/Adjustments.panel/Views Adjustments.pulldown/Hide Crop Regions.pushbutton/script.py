@@ -14,8 +14,8 @@ while _ext_dir and not _ext_dir.endswith('.extension'):
 sys.path.append(_os.path.join(_ext_dir, 'lib'))
 from magictools import ui
 
-doc    = revit.doc
-output = script.get_output()
+doc = revit.doc
+SEP = u"─" * 55
 
 # ─────────────────────────────────────────────────────────────────────────────
 # 1. Select master views
@@ -41,7 +41,10 @@ master_views = sorted(master_views, key=lambda v: v.Name)
 chosen = ui.pick_list(
     [v.Name for v in master_views],
     "Select Master Views",
-    button_name="Hide Crops"
+    button_name="Hide Crops",
+    context=u"Tick the masters whose dependents you want to affect. The tool hides "
+            u"the crop region (not the annotation crop) on every dependent view "
+            u"under the selected masters. The masters themselves are not touched."
 )
 if not chosen:
     script.exit()
@@ -61,7 +64,11 @@ for master in selected:
         if v:
             dep_views.append((master.Name, v))
 
-output.print_md("**Dependent views found:** {}".format(len(dep_views)))
+lines = []
+lines.append(u"Master views selected: {}".format(len(selected)))
+lines.append(u"Dependent views found: {}".format(len(dep_views)))
+lines.append(u"")
+lines.append(SEP)
 
 # ─────────────────────────────────────────────────────────────────────────────
 # 3. Hide crop regions
@@ -77,17 +84,29 @@ with revit.Transaction("Hide Crop Regions"):
             if v.CropBoxVisible:
                 v.CropBoxVisible = False
                 hidden += 1
-                output.print_md("  ✅ *{}*".format(v.Name))
+                lines.append(u"  ✅ {}".format(v.Name))
             else:
                 skipped += 1
         except Exception as e:
-            errors.append("{}: {}".format(v.Name, str(e)))
+            errors.append(u"{}: {}".format(v.Name, str(e)))
 
-output.print_md("\n---")
-output.print_md("✅ **{}** crop regions hidden".format(hidden))
-output.print_md("⏭️ **{}** already hidden, skipped".format(skipped))
+# ─────────────────────────────────────────────────────────────────────────────
+# 4. Report
+# ─────────────────────────────────────────────────────────────────────────────
+
+lines.append(u"")
+lines.append(SEP)
+lines.append(u"✅  {} crop regions hidden".format(hidden))
+lines.append(u"⏭️  {} already hidden, skipped".format(skipped))
 
 if errors:
-    output.print_md("❌ **{} errors:**".format(len(errors)))
+    lines.append(u"❌  {} error(s):".format(len(errors)))
     for e in errors:
-        output.print_md("  - {}".format(e))
+        lines.append(u"  - {}".format(e))
+
+ui.show_report(
+    text     = u"\n".join(lines),
+    title    = u"Hide Crop Regions",
+    subtitle = u"{} views processed".format(len(dep_views)),
+    summary  = u"✅ {}  ⏭️ {}  ❌ {}".format(hidden, skipped, len(errors)),
+)

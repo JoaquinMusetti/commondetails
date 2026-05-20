@@ -17,8 +17,8 @@ while _ext_dir and not _ext_dir.endswith('.extension'):
 _sys.path.append(_os.path.join(_ext_dir, 'lib'))
 from magictools import ui
 
-doc    = revit.doc
-output = script.get_output()
+doc = revit.doc
+SEP = u"─" * 55
 
 # ─────────────────────────────────────────────────────────────────────────────
 # 1. Pick JSON file
@@ -34,8 +34,9 @@ if not json_path:
 with open(json_path, "r") as f:
     data = json.load(f)
 
-output.print_md("**Linked model in JSON:** `{}`".format(data.get("link_doc_name", "")))
-output.print_md("**Master views in JSON:** {}".format(len(data["master_views"])))
+lines = []
+lines.append(u"Linked model: {}".format(data.get("link_doc_name", "")))
+lines.append(u"Master views in JSON: {}".format(len(data["master_views"])))
 
 # ─────────────────────────────────────────────────────────────────────────────
 # 2. Index current dependent views in model
@@ -95,15 +96,16 @@ for v in all_views:
 # 3. Compare JSON vs model
 # ─────────────────────────────────────────────────────────────────────────────
 
-output.print_md("\n---")
+lines.append(u"")
+lines.append(SEP)
+lines.append(u"Comparison: JSON vs Model")
+lines.append(SEP)
 
 total_missing  = 0
 total_new      = 0
 total_ok       = 0
 master_missing = []
 
-# Collect all missing and new views across all master views for rename detection
-# {view_name: title_on_sheet}
 all_missing = {}
 all_new     = {}
 
@@ -113,7 +115,7 @@ for view_data in data["master_views"]:
 
     if master_name not in master_by_name:
         master_missing.append(master_name)
-        output.print_md("### ❌ Master view not found: *{}*".format(master_name))
+        lines.append(u"❌ Master view not found: {}".format(master_name))
         continue
 
     model_names = model_deps_by_master.get(master_name, [])
@@ -128,7 +130,6 @@ for view_data in data["master_views"]:
     total_new     += len(new)
     total_ok      += len(ok)
 
-    # Collect titles for rename detection
     for name in missing:
         title = json_views[name].get("title_on_sheet", "")
         if title:
@@ -141,24 +142,22 @@ for view_data in data["master_views"]:
                 all_new[name] = title
 
     if missing or new:
-        output.print_md("### ⚠️  {}".format(master_name))
+        lines.append(u"⚠   {}".format(master_name))
         if missing:
-            output.print_md("  **In JSON but NOT in model** — removed or renamed:")
+            lines.append(u"  In JSON but NOT in model (removed or renamed):")
             for name in sorted(missing):
-                output.print_md("  🔴 *{}*".format(name))
+                lines.append(u"    \U0001f534 {}".format(name))
         if new:
-            output.print_md("  **In model but NOT in JSON** — new, not exported yet:")
+            lines.append(u"  In model but NOT in JSON (new, not exported yet):")
             for name in sorted(new):
-                output.print_md("  ➕ *{}*".format(name))
+                lines.append(u"    ➕ {}".format(name))
     else:
-        output.print_md("### ✅ {}  — all {} views in sync".format(
-            master_name, len(ok)))
+        lines.append(u"✅  {} — all {} views in sync".format(master_name, len(ok)))
 
 # ─────────────────────────────────────────────────────────────────────────────
 # 4. Detect renames by title on sheet match
 # ─────────────────────────────────────────────────────────────────────────────
 
-# Build {title_on_sheet: old_name} and {title_on_sheet: new_name}
 title_to_missing = {}
 for name, title in all_missing.items():
     if title not in title_to_missing:
@@ -171,46 +170,55 @@ for name, title in all_new.items():
         title_to_new[title] = []
     title_to_new[title].append(name)
 
-# Find exact title matches — one missing + one new with same title
 rename_suggestions = []
 for title, missing_names in title_to_missing.items():
     if title in title_to_new:
         new_names = title_to_new[title]
         if len(missing_names) == 1 and len(new_names) == 1:
             rename_suggestions.append({
-                "old_name":      missing_names[0],
-                "new_name":      new_names[0],
+                "old_name":       missing_names[0],
+                "new_name":       new_names[0],
                 "title_on_sheet": title
             })
 
 # ─────────────────────────────────────────────────────────────────────────────
-# 5. Final summary
+# 5. Summary
 # ─────────────────────────────────────────────────────────────────────────────
 
-output.print_md("\n---")
-output.print_md("## Summary")
+lines.append(u"")
+lines.append(SEP)
+lines.append(u"SUMMARY")
+lines.append(SEP)
 
 if total_missing == 0 and total_new == 0 and not master_missing:
-    output.print_md("✅ **Everything in sync.** JSON matches the model perfectly.")
-    output.print_md("Safe to proceed with Import Dependent Views.")
+    lines.append(u"✅  Everything in sync. JSON matches the model perfectly.")
+    lines.append(u"Safe to proceed with Import Dependent Views.")
+    ui.show_report(
+        text     = u"\n".join(lines),
+        title    = u"Audit Source Views",
+        subtitle = u"{} master views checked".format(len(data["master_views"])),
+        summary  = u"✅ all in sync",
+    )
     script.exit()
 
-output.print_md("⚠️  **Sync issues detected — review before importing.**")
+lines.append(u"⚠   Sync issues detected — review before importing.")
 if total_missing:
-    output.print_md("🔴 **{}** view(s) in JSON no longer exist in model".format(total_missing))
+    lines.append(u"\U0001f534 {} view(s) in JSON no longer exist in model".format(total_missing))
 if total_new:
-    output.print_md("➕ **{}** new view(s) in model not yet in JSON".format(total_new))
+    lines.append(u"➕ {} new view(s) in model not yet in JSON".format(total_new))
 if master_missing:
-    output.print_md("❌ **{}** master view(s) not found in model:".format(len(master_missing)))
+    lines.append(u"❌ {} master view(s) not found in model:".format(len(master_missing)))
     for name in master_missing:
-        output.print_md("  - *{}*".format(name))
+        lines.append(u"  - {}".format(name))
 
 if rename_suggestions:
-    output.print_md("\n---")
-    output.print_md("## Possible Renames Detected")
-    output.print_md("The following views have matching Title on Sheet — likely renamed:")
+    lines.append(u"")
+    lines.append(SEP)
+    lines.append(u"Possible Renames Detected")
+    lines.append(SEP)
+    lines.append(u"Views with matching Title on Sheet — likely renamed:")
     for r in rename_suggestions:
-        output.print_md("  🔄 *{}*  →  *{}*  (title: `{}`)".format(
+        lines.append(u"  \U0001f504 {}  →  {}  (title: {})".format(
             r["old_name"], r["new_name"], r["title_on_sheet"]))
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -218,22 +226,38 @@ if rename_suggestions:
 # ─────────────────────────────────────────────────────────────────────────────
 
 if not rename_suggestions:
-    output.print_md("\nRun **Export Dependent Views** to update the JSON before importing.")
+    lines.append(u"")
+    lines.append(u"Run Export Dependent Views to update the JSON before importing.")
+    ui.show_report(
+        text     = u"\n".join(lines),
+        title    = u"Audit Source Views",
+        subtitle = u"{} master views checked".format(len(data["master_views"])),
+        summary  = u"\U0001f534 {}  ➕ {}  ❌ {}".format(
+            total_missing, total_new, len(master_missing)),
+    )
     script.exit()
 
 confirm = ui.confirm(
-    "{} possible rename(s) detected based on matching Title on Sheet.\n\n{}\n\n"
-    "Confirm these renames and generate renames.json?".format(
+    u"{} possible rename(s) detected based on matching Title on Sheet.\n\n{}\n\n"
+    u"Confirm these renames and generate renames.json?".format(
         len(rename_suggestions),
-        "\n".join(["  {} -> {}".format(r["old_name"], r["new_name"])
-                   for r in rename_suggestions])
+        u"\n".join([u"  {} -> {}".format(r["old_name"], r["new_name"])
+                    for r in rename_suggestions])
     ),
     title="Confirm Renames",
     yes_text="Confirm"
 )
 
 if not confirm:
-    output.print_md("\n⏭️  Renames not confirmed. Run **Export Dependent Views** to update the JSON.")
+    lines.append(u"")
+    lines.append(u"⏭  Renames not confirmed. Run Export Dependent Views to update the JSON.")
+    ui.show_report(
+        text     = u"\n".join(lines),
+        title    = u"Audit Source Views",
+        subtitle = u"{} master views checked".format(len(data["master_views"])),
+        summary  = u"\U0001f534 {}  ➕ {}  \U0001f504 {} possible renames".format(
+            total_missing, total_new, len(rename_suggestions)),
+    )
     script.exit()
 
 save_path = forms.save_file(
@@ -247,6 +271,16 @@ if not save_path:
 with open(save_path, "w") as f:
     json.dump(rename_suggestions, f, indent=2)
 
-output.print_md("\n✅ **renames.json saved** → `{}`".format(save_path))
-output.print_md("Run **Rename Dependent Views** in each destination model to apply the renames.")
-output.print_md("Then run **Export Dependent Views** to update the JSON.")
+lines.append(u"")
+lines.append(SEP)
+lines.append(u"✅  renames.json saved → {}".format(save_path))
+lines.append(u"Run Rename Dependent Views in each destination model to apply the renames.")
+lines.append(u"Then run Export Dependent Views to update the JSON.")
+
+ui.show_report(
+    text     = u"\n".join(lines),
+    title    = u"Audit Source Views",
+    subtitle = u"{} master views checked".format(len(data["master_views"])),
+    summary  = u"\U0001f534 {}  ➕ {}  \U0001f504 {} renames saved".format(
+        total_missing, total_new, len(rename_suggestions)),
+)

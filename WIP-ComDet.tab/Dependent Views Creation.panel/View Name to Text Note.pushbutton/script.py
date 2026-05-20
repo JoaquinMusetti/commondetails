@@ -116,8 +116,10 @@ if not type_dict:
 chosen_type_name = ui.pick_list(
     sorted(type_dict.keys()),
     "Select Text Type",
-    prompt="What text type do you want to use?",
     multiselect=False,
+    context=u"Text type to use. The tool places a TextNote at the center of the "
+            u"crop box of each selected view, using the view's name as the content. "
+            u"Used to label dependent views on the master view."
 )
 if not chosen_type_name:
     script.exit()

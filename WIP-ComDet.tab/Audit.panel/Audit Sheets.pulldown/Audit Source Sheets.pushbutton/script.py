@@ -33,6 +33,7 @@ except Exception:
     HAS_CLIPBOARD = False
 
 output = script.get_output()
+output.close()
 
 # ─────────────────────────────────────────────────────────────────────────────
 # 1. Pick the two JSON snapshots
@@ -631,17 +632,14 @@ if HAS_CLIPBOARD:
         except Exception as e2:
             output.print_md("\n[!] Could not copy to clipboard: {}".format(e2))
 
-output.print_md("\n---")
-if copied:
-    output.print_md(
-        "[OK] **Report copied to clipboard ({}).** Paste it into Teams "
-        "(Ctrl+V) — bold and bullets will render. "
-        "If Teams strips formatting, paste with **Ctrl+Shift+V** (keep formatting).".format(
-            copied_format))
-else:
-    output.print_md("**Report** (copy manually from below):")
+copy_subtitle = u"Copied to clipboard ({}) ✓".format(copied_format) if copied else u"Could not copy to clipboard"
 
-output.print_md("\n```\n{}\n```".format(plain_text))
+ui.show_report(
+    text     = plain_text,
+    title    = u"Updates Report",
+    subtitle = copy_subtitle,
+    summary  = u"  •  ".join(headline_bits) if headline_bits else u"No changes",
+)
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -931,6 +929,5 @@ if ui.confirm(
                 "Detail Sheets Update Report",
                 subtitle_pdf,
                 build_pdf_blocks())
-            output.print_md("📄 **PDF saved:** `{}`".format(pdf_path))
         except Exception as e:
-            output.print_md("❌ PDF export failed: {}".format(e))
+            ui.alert(u"PDF export failed: {}".format(e), title="Updates Report")

@@ -245,6 +245,10 @@ win = ui.parse(
     "Set annotation crop offset (inches) for selected views",
     _BODY, _FOOTER,
     width=800, height=760,
+    context=u"Set the annotation crop offset (the breathing room between the crop "
+            u"box and the annotation crop) on the views you tick below. Standard "
+            u"workflow value for Common Details is 1/8\" on all four sides. The new "
+            u"'Import Sheets with Views' tool already applies this automatically."
 )
 
 presetPanel = win.FindName("presetPanel")
