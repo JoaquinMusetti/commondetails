@@ -1,0 +1,38 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 96 96" width="96" height="96">
+  <title>Apply Detail Numbers - Abstract Grid</title>
+  <defs>
+    <linearGradient id="magicGradient" x1="0%" y1="100%" x2="100%" y2="0%">
+      <stop offset="0%" stop-color="#4a90e2" />
+      <stop offset="100%" stop-color="#9013fe" />
+    </linearGradient>
+  </defs>
+
+  <rect x="10" y="10" width="76" height="76" rx="3" fill="none" stroke="#888888" stroke-width="4"/>
+  <line x1="72" y1="10" x2="72" y2="86" stroke="#888888" stroke-width="4" stroke-linecap="round"/>
+
+  <g stroke="#888888" stroke-width="2" stroke-dasharray="3 3" opacity="0.4">
+    <line x1="22" y1="10" x2="22" y2="86" />
+    <line x1="35" y1="10" x2="35" y2="86" />
+    <line x1="47" y1="10" x2="47" y2="86" />
+    <line x1="60" y1="10" x2="60" y2="86" />
+    <line x1="10" y1="25" x2="72" y2="25" />
+    <line x1="10" y1="40" x2="72" y2="40" />
+    <line x1="10" y1="56" x2="72" y2="56" />
+    <line x1="10" y1="71" x2="72" y2="71" />
+  </g>
+
+  <path d="M 38 28 L 30 68 
+           M 58 28 L 50 68 
+           M 22 40 L 64 40 
+           M 18 56 L 60 56" 
+        fill="none" stroke="url(#magicGradient)" stroke-width="6" stroke-linecap="round" stroke-linejoin="round"/>
+
+  <g stroke="#2c3e50" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round">
+    <circle cx="66" cy="78" r="1.5" fill="#2c3e50" stroke="none"/>
+    <path d="M 66 75 L 66 68" />
+    <polyline points="63.5,70.5 66,68 68.5,70.5" />
+  </g>
+
+  <path d="M 84 14 Q 84 18 88 18 Q 84 18 84 22 Q 84 18 80 18 Q 84 18 84 14 Z" fill="#f5a623" />
+  <path d="M 12 80 Q 12 84 16 84 Q 12 84 12 88 Q 12 84 8 84 Q 12 84 12 80 Z" fill="#f5a623" />
+</svg>
