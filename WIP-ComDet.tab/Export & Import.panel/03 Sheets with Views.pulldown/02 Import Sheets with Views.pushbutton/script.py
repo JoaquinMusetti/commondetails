@@ -402,6 +402,7 @@ with revit.Transaction("Add Detail ID parameter"):
 total_v_created     = 0
 total_v_updated     = 0
 total_v_skipped     = 0
+total_v_orphan      = 0   # subset of created: dependents marked placed_on_sheet=False
 total_id_stamped    = 0
 total_crop_adjusted = 0   # Pass 3: AnnotationCropOffset 1/8" + CropBoxVisible=False
 view_results        = []   # (status, master_name, view_name, detail_str)
@@ -541,6 +542,8 @@ with ui.ProgressBar(title=u"Import Sheets with Views", cancellable=True, step=5)
                                             dv_id or u"—",
                                             title_on_sheet or u"(no title)")))
                     total_v_created += 1
+                    if dv_data.get("placed_on_sheet", True) is False:
+                        total_v_orphan += 1
                     existing_proj_names.add(final_name)
                     dep_view_by_name[final_name] = new_view   # make available for sheet phase
 
@@ -907,6 +910,11 @@ _BODY_XAML = u"""
             Visibility="Collapsed">
       <TextBlock x:Name="badgeCrop" Foreground="#B8A0E8" FontFamily="Segoe UI" FontSize="13"/>
     </Border>
+    <Border x:Name="badgeOrphanBorder" Background="#1A2238" BorderBrush="#8088A8"
+            BorderThickness="1" CornerRadius="4" Padding="10,4" Margin="0,0,8,0"
+            Visibility="Collapsed">
+      <TextBlock x:Name="badgeOrphan" Foreground="#8088A8" FontFamily="Segoe UI" FontSize="13"/>
+    </Border>
     <Border x:Name="badgeErrorBorder" Background="#3C1212" BorderBrush="#FF7070"
             BorderThickness="1" CornerRadius="4" Padding="10,4"
             Visibility="Collapsed">
@@ -1007,6 +1015,11 @@ if total_crop_adjusted:
     win.FindName("badgeCropBorder").Visibility = Visibility.Visible
     win.FindName("badgeCrop").Text = u"✂️  {} crops adjusted (1/8\" + hidden)".format(
         total_crop_adjusted)
+
+if total_v_orphan:
+    win.FindName("badgeOrphanBorder").Visibility = Visibility.Visible
+    win.FindName("badgeOrphan").Text = u"🌒  {} orphan view{} (unplaced)".format(
+        total_v_orphan, u"s" if total_v_orphan != 1 else u"")
 
 if n_errors:
     win.FindName("badgeErrorBorder").Visibility = Visibility.Visible

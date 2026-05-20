@@ -260,6 +260,87 @@ with ui.ProgressBar(title=u"Export Sheets with Views", cancellable=True, step=1)
             break
 
 # ─────────────────────────────────────────────────────────────────────────────
+# 5a. Pass B — capture orphan dependents (created but not placed on
+#     selected sheets). Same masters as Pass A; we only add dep views that
+#     weren't already exported. This brings parity with the legacy
+#     "Export Views" tool which captured ALL dependents unfiltered.
+# ─────────────────────────────────────────────────────────────────────────────
+
+orphan_count = 0
+
+# Tag each Pass-A dep as placed (so consumers can tell apart)
+for mv_data in master_views_data:
+    for dv in mv_data["dependent_views"]:
+        dv.setdefault("placed_on_sheet", True)
+
+# Reverse index: master name → master view object (Pass A only kept names)
+master_view_by_name = {v.Name: v for v in master_view_by_id.values()}
+
+if not cancelled:
+    for mv_data in master_views_data:
+        mv_name = mv_data["view_name"]
+        master_obj = master_view_by_name.get(mv_name)
+        if master_obj is None:
+            # "Unknown Master" or master we couldn't resolve — can't enumerate deps
+            continue
+        already_exported = {dv["view_name"] for dv in mv_data["dependent_views"]}
+        for dep_id in master_obj.GetDependentViewIds():
+            dep = doc.GetElement(dep_id)
+            if dep is None or dep.Name in already_exported:
+                continue
+            try:
+                crop_box = dep.CropBox
+                if crop_box is None:
+                    results.append(("warning", mv_name, dep.Name,
+                                    u"Orphan skipped: no CropBox"))
+                    continue
+
+                min_pt    = crop_box.Min
+                max_pt    = crop_box.Max
+                transform = crop_box.Transform
+                local_corners = [
+                    DB.XYZ(min_pt.X, min_pt.Y, min_pt.Z),
+                    DB.XYZ(max_pt.X, min_pt.Y, min_pt.Z),
+                    DB.XYZ(max_pt.X, max_pt.Y, min_pt.Z),
+                    DB.XYZ(min_pt.X, max_pt.Y, min_pt.Z),
+                ]
+                world_corners = [transform.OfPoint(c) for c in local_corners]
+                rel_corners   = [xyz_to_list(world_to_link(c, link_transform))
+                                 for c in world_corners]
+
+                title_on_sheet = ""
+                try:
+                    p = dep.get_Parameter(DB.BuiltInParameter.VIEW_DESCRIPTION)
+                    if p:
+                        title_on_sheet = p.AsString() or ""
+                except Exception:
+                    pass
+
+                template_name = ""
+                tid = dep.ViewTemplateId
+                if tid != DB.ElementId.InvalidElementId:
+                    tmpl = doc.GetElement(tid)
+                    if tmpl:
+                        template_name = tmpl.Name
+
+                mv_data["dependent_views"].append({
+                    "view_name":       dep.Name,
+                    "detail_id":       get_detail_id(dep),
+                    "title_on_sheet":  title_on_sheet,
+                    "crop_corners":    rel_corners,
+                    "view_template":   template_name,
+                    "view_scale":      dep.Scale,
+                    "view_type":       str(dep.ViewType),
+                    "placed_on_sheet": False,
+                })
+                results.append(("orphan", mv_name, dep.Name,
+                                title_on_sheet or u"(no title)"))
+                orphan_count += 1
+            except Exception as e:
+                results.append(("error", mv_name, dep.Name, u"Orphan: " + str(e)))
+                errors += 1
+
+# ─────────────────────────────────────────────────────────────────────────────
 # 5b. Build sheets section (separate pass over selected_sheets)
 # ─────────────────────────────────────────────────────────────────────────────
 
@@ -414,6 +495,11 @@ _BODY_XAML = u"""
             CornerRadius="4" Padding="10,4" Margin="0,0,8,0">
       <TextBlock x:Name="badgeLink" Foreground="#7EB4F0" FontFamily="Segoe UI" FontSize="13"/>
     </Border>
+    <Border x:Name="badgeOrphanBorder" Background="#2A1E40" BorderBrush="#B8A0E8"
+            BorderThickness="1" CornerRadius="4" Padding="10,4" Margin="0,0,8,0"
+            Visibility="Collapsed">
+      <TextBlock x:Name="badgeOrphan" Foreground="#B8A0E8" FontFamily="Segoe UI" FontSize="13"/>
+    </Border>
     <Border x:Name="badgeErrorBorder" Background="#3C1212" BorderBrush="#FF7070"
             BorderThickness="1" CornerRadius="4" Padding="10,4"
             Visibility="Collapsed">
@@ -490,6 +576,10 @@ for status, master, name, detail in results:
 win = ui.parse(u"Export Sheets with Views", subtitle, _BODY_XAML, _FOOTER_XAML, width=960, height=560)
 
 win.FindName("badgeViews").Text   = u"✅  {} views exported".format(exported)
+if orphan_count:
+    win.FindName("badgeOrphanBorder").Visibility = Visibility.Visible
+    win.FindName("badgeOrphan").Text = u"🌒  {} orphan view{} (not placed)".format(
+        orphan_count, u"s" if orphan_count != 1 else u"")
 win.FindName("badgeSheets").Text  = u"\U0001f4c4  {} sheets".format(len(sheet_layout))
 win.FindName("badgeLink").Text    = u"\U0001f517  {}".format(
     chosen_link.split(" : ")[-1] if " : " in chosen_link else chosen_link)
