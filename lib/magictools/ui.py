@@ -605,11 +605,13 @@ def show_report(text, title="Report", subtitle="", summary="",
 # ── Progress bar ──────────────────────────────────────────────────────────────
 
 class ProgressBar(object):
-    """Bottom-anchored pyRevit progress bar — standard for Magic Tools / Toolcraft.
+    """Top-anchored pyRevit progress bar — Noir convention.
 
-    Wraps pyrevit.forms.ProgressBar and repositions the window to the bottom
-    edge of the Revit window (clamped to the screen working area so it never
-    slips behind the taskbar).
+    Plain pass-through to ``pyrevit.forms.ProgressBar``. The window anchors
+    to the TOP edge of the Revit window (pyRevit default). Kept as a class
+    wrapper so callers continue to use ``ui.ProgressBar(...)`` as they did
+    before — the only change vs. the previous bottom-anchored variant is
+    the position.
 
     Usage (identical to forms.ProgressBar):
 
@@ -622,40 +624,8 @@ class ProgressBar(object):
                 pb.title = u"My Tool — {}/{} — {}".format(i+1, n, item.Name)
                 # ... process ...
                 pb.update_progress(i + 1, n)
-
-    Returns (results, n_total, was_cancelled) is the recommended function
-    signature for batch-scan functions — see pattern_progress_bar.md.
     """
 
     def __new__(cls, *args, **kwargs):
-        from pyrevit import forms, HOST_APP
-        from pyrevit import revit as _pvr
-
-        class _BottomProgressBar(forms.ProgressBar):
-            def update_window(self):
-                # Reimplements TemplatePromptBar.update_window() entirely so the
-                # window is positioned at the BOTTOM in one step, never at top.
-                # Calling super() first would flash the window to the top before
-                # we moved it down, causing visible flicker on every update.
-                try:
-                    screen_area = HOST_APP.proc_screen_workarea
-                    window_rect = _pvr.ui.get_window_rectangle()
-                    scale = 1.0 / HOST_APP.proc_screen_scalefactor
-
-                    width = window_rect.Right - window_rect.Left
-                    left  = window_rect.Left
-                    left_diff = abs(screen_area.Left - left)
-                    if 10 > left_diff > 0 and left_diff < width:
-                        width -= left_diff * 2
-                        left = screen_area.Left
-
-                    bottom = min(window_rect.Bottom, screen_area.Bottom)
-
-                    self.Top    = (bottom - self.user_height) * scale
-                    self.Left   = left  * scale
-                    self.Width  = width * scale
-                    self.Height = self.user_height
-                except Exception:
-                    super(_BottomProgressBar, self).update_window()  # fallback: top
-
-        return _BottomProgressBar(*args, **kwargs)
+        from pyrevit import forms
+        return forms.ProgressBar(*args, **kwargs)
