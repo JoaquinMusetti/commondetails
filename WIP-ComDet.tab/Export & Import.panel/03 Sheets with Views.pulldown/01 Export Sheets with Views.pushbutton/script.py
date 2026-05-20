@@ -30,6 +30,10 @@ def xyz_to_list(pt):
     return [pt.X, pt.Y, pt.Z]
 
 def world_to_link(pt, link_transform):
+    # link_transform=None means "we're exporting from Common Details itself"
+    # — no link to reference, coordinates are already in CD local space.
+    if link_transform is None:
+        return pt
     return link_transform.Inverse.OfPoint(pt)
 
 def get_detail_id(view):
@@ -48,34 +52,38 @@ def get_viewport_type_name(vp):
         return ""
 
 # ─────────────────────────────────────────────────────────────────────────────
-# 1. Select Common Details linked model
+# 1. Select Common Details linked model (or 'None' if exporting from CD itself)
 # ─────────────────────────────────────────────────────────────────────────────
+
+NONE_OPTION = "None (I'm exporting from the Common Details file itself)"
 
 link_instances = DB.FilteredElementCollector(doc)\
     .OfClass(DB.RevitLinkInstance)\
     .ToElements()
 
-if not link_instances:
-    ui.alert("No linked models found in this document.", title="Export Sheets with Views")
-    script.exit()
-
 link_by_name = {li.Name: li for li in link_instances}
+link_options = [NONE_OPTION] + sorted(link_by_name.keys())
 
 chosen_link = ui.pick_list(
-    sorted(link_by_name.keys()),
+    link_options,
     "1 of 3 — Reference Linked Model",
     button_name="Next",
     multiselect=False,
-    context=u"Pick the Common Details link. We need it to transform the coordinates "
-            u"of this building's custom details into Common Details space (where they "
-            u"will live after the merge). It's the basis of the calculation — you can't "
-            u"skip it."
+    context=u"Pick the Common Details link if you're exporting from a BUILDING — "
+            u"the tool uses its transform to convert the building's custom-detail "
+            u"coordinates into Common Details space. Pick 'None' if you're "
+            u"exporting from the Common Details file itself (no transform needed; "
+            u"coordinates are already in CD local space)."
 )
 if not chosen_link:
     script.exit()
 
-link_instance  = link_by_name[chosen_link]
-link_transform = link_instance.GetTotalTransform()
+if chosen_link == NONE_OPTION:
+    link_instance  = None
+    link_transform = None
+else:
+    link_instance  = link_by_name[chosen_link]
+    link_transform = link_instance.GetTotalTransform()
 
 # ─────────────────────────────────────────────────────────────────────────────
 # 2. Select sheets
@@ -427,8 +435,10 @@ for sheet in selected_sheets:
 
 export_data = {
     "format":        "sheets_with_views",
-    "link_doc_name": chosen_link,
-    "link_origin":   xyz_to_list(link_transform.Origin),
+    "link_doc_name": "" if link_transform is None else chosen_link,
+    "link_origin":   [0.0, 0.0, 0.0] if link_transform is None
+                                     else xyz_to_list(link_transform.Origin),
+    "exported_from_cd": link_transform is None,
     "master_views":  master_views_data,
     "sheets":        sheet_layout,
 }
@@ -581,8 +591,11 @@ if orphan_count:
     win.FindName("badgeOrphan").Text = u"🌒  {} orphan view{} (not placed)".format(
         orphan_count, u"s" if orphan_count != 1 else u"")
 win.FindName("badgeSheets").Text  = u"\U0001f4c4  {} sheets".format(len(sheet_layout))
-win.FindName("badgeLink").Text    = u"\U0001f517  {}".format(
-    chosen_link.split(" : ")[-1] if " : " in chosen_link else chosen_link)
+if link_transform is None:
+    win.FindName("badgeLink").Text = u"\U0001f3e0  Exported from Common Details (no link)"
+else:
+    win.FindName("badgeLink").Text = u"\U0001f517  {}".format(
+        chosen_link.split(" : ")[-1] if " : " in chosen_link else chosen_link)
 if errors:
     win.FindName("badgeErrorBorder").Visibility = Visibility.Visible
     win.FindName("badgeErrors").Text = u"❌  {} error{}".format(
