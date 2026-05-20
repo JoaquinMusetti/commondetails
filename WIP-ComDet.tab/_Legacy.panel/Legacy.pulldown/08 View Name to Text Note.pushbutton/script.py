@@ -13,6 +13,26 @@ sys.path.append(_os.path.join(
 ))
 from magictools import ui
 
+# ─────────────────────────────────────────────────────────────────────────────
+# Legacy guard — confirm before running. This tool was moved to the Legacy
+# pulldown on 2026-05-19 because the combined "Sheets with Views" flow now
+# covers its workflow. Kept here for backwards-compat with old JSONs.
+# ─────────────────────────────────────────────────────────────────────────────
+if not ui.confirm(
+    u"This tool is part of the LEGACY workflow.\n\n"
+    u"The current workflow uses 'Export Sheets with Views' + 'Import "
+    u"Sheets with Views' (and their PRO variant) from the Export & Import "
+    u"panel. The matching new Audit tools live under Audit > Audit Views / "
+    u"Audit Sheets pulldowns.\n\n"
+    u"Continue with the legacy tool anyway?",
+    title=u"Legacy Tool",
+    yes_text=u"Continue (legacy)",
+    context=u"Common Details migrated to a combined JSON flow on 2026-05-19. "
+            u"The legacy tools stay here in case you need to interop with old "
+            u"JSONs or a feature not yet covered in the new flow."
+):
+    script.exit()
+
 from pyrevit import revit, DB, script
 
 doc   = revit.doc
