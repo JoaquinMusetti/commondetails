@@ -208,13 +208,63 @@ if data_master.get("format") != "sheets_with_views":
     )
     script.exit()
 
-# 2. Strategy (existing dependents)
+# 2. Select which sheets to import (same set applied to all docs)
+sheets_in_json_master = data_master.get("sheets", [])
+if not sheets_in_json_master:
+    ui.alert(
+        u"This JSON has no 'sheets' section — nothing to import.\n\n"
+        u"Make sure it was exported with 'Export Sheets with Views' and "
+        u"that at least one sheet was selected during the export.",
+        title=u"Import Sheets with Views PRO"
+    )
+    script.exit()
+
+sheet_options_master = [
+    u"{} - {}  ({} views)".format(
+        sh["sheet_number"], sh.get("sheet_name", ""),
+        len(sh.get("viewports", [])))
+    for sh in sheets_in_json_master
+]
+chosen_sheet_picks = ui.pick_list(
+    sheet_options_master,
+    "2 of 7 — Select Sheets to Import",
+    multiselect=True,
+    context=u"Tick which sheets from the JSON to apply to EVERY destination doc. "
+            u"The tool figures out per doc which dependents each sheet needs and "
+            u"creates them under their matching masters. Same selection used for "
+            u"all docs in the batch."
+)
+if not chosen_sheet_picks:
+    script.exit()
+
+chosen_sheet_numbers_master = {opt.split(" - ", 1)[0] for opt in chosen_sheet_picks}
+# Pre-filter data_master to only the chosen sheets + derived views.
+data_master["sheets"] = [sh for sh in sheets_in_json_master
+                         if sh["sheet_number"] in chosen_sheet_numbers_master]
+_required = set()
+for _sh in data_master["sheets"]:
+    for _vp in _sh.get("viewports", []):
+        _vn = _vp.get("view_name")
+        if _vn:
+            _required.add(_vn)
+_filtered_masters = []
+for _mv in data_master["master_views"]:
+    _kept = [dv for dv in _mv["dependent_views"] if dv["view_name"] in _required]
+    if _kept:
+        _filtered_masters.append({
+            "view_name":       _mv["view_name"],
+            "view_scale":      _mv.get("view_scale"),
+            "dependent_views": _kept,
+        })
+data_master["master_views"] = _filtered_masters
+
+# 3. Strategy (existing dependents)
 strategy = ui.pick_list(
     [
         "Skip existing — do not touch dependent views that already exist",
         "Update existing — re-apply crop boundary to views that already exist",
     ],
-    "2 of 7 — Strategy for Existing Dependent Views",
+    "3 of 7 — Strategy for Existing Dependent Views",
     button_name="Next",
     multiselect=False,
     context=u"PRO applies the same strategy to every selected document. "
@@ -226,7 +276,7 @@ if not strategy:
     script.exit()
 update_existing = "Update" in strategy
 
-# 3. Sheet update options
+# 4. Sheet update options
 sheet_options_list = [
     "VIEWPORTS | Position & Title location",
     "VIEWPORTS | Match viewport types",
@@ -236,7 +286,7 @@ sheet_options_list = [
 ]
 chosen_sheet_opts = ui.pick_list(
     sheet_options_list,
-    "3 of 7 — Sheet Update Options",
+    "4 of 7 — Sheet Update Options",
     button_name="Next",
     context=u"If sheets already exist in a destination doc: pick what to overwrite. "
             u"Same setting is applied to every doc in the batch."
@@ -269,7 +319,7 @@ if not all_open_docs:
 doc_labels = sorted([d_.Title for d_ in all_open_docs])
 chosen_doc_labels = ui.pick_list(
     doc_labels,
-    "4 of 7 — Select Destination Documents",
+    "5 of 7 — Select Destination Documents",
     button_name="Next",
     context=u"Pick the open Revit docs you want to import into. The tool does "
             u"NOT open files — they must already be loaded in this session. For "
@@ -287,7 +337,7 @@ NONE_OPTION = "None (import into Common Details itself)"
 
 doc_configs = []   # list of (target_doc, prefix, link_name_or_None)
 
-step = 5
+step = 6
 for target_doc in chosen_docs:
     prefix = ui.ask_for_string(
         prompt="Prefix for:\n\n  {}\n\n(e.g. AE, AB, AC, AS for Site, CD for Common Details)".format(
@@ -319,7 +369,7 @@ for target_doc in chosen_docs:
         script.exit()
 
     doc_configs.append((target_doc, prefix, link_choice if link_choice != NONE_OPTION else None))
-    step = min(step + 1, 6)   # cap label at "6 of 7" for the last per-doc step
+    # cap label at "6 of 7" — the confirmation is always step 7
 
 # 6. Confirmation
 total_masters_in_json = len(data_master.get("master_views", []))
@@ -364,7 +414,6 @@ def import_one_doc(target_doc, dest_prefix, link_instance_name, data_in, pb, tot
         "v_created":     0,
         "v_updated":     0,
         "v_skipped":     0,
-        "v_orphan":      0,
         "ids_stamped":   0,
         "crop_adjusted": 0,
         "vp_created":    0,
@@ -589,8 +638,6 @@ def import_one_doc(target_doc, dest_prefix, link_instance_name, data_in, pb, tot
 
                     pending_crops.append((new_view, make_crop_loop(corners_world)))
                     res["v_created"] += 1
-                    if dv_data.get("placed_on_sheet", True) is False:
-                        res["v_orphan"] += 1
                     existing_proj_names.add(final_name)
                     dep_view_by_name[final_name] = new_view
                 except Exception:
@@ -845,7 +892,6 @@ agg = {
     "v_created":     sum(r["v_created"]     for r in all_results),
     "v_updated":     sum(r["v_updated"]     for r in all_results),
     "v_skipped":     sum(r["v_skipped"]     for r in all_results),
-    "v_orphan":      sum(r["v_orphan"]      for r in all_results),
     "crop_adjusted": sum(r["crop_adjusted"] for r in all_results),
     "ids_stamped":   sum(r["ids_stamped"]   for r in all_results),
     "vp_created":    sum(r["vp_created"]    for r in all_results),
@@ -866,8 +912,8 @@ lines_out = [
     u"Aggregated totals:",
     u"  ✅ {} views created    🔄 {} updated    ⏭ {} skipped".format(
         agg["v_created"], agg["v_updated"], agg["v_skipped"]),
-    u"  🌒 {} orphans (unplaced)    ✂️ {} crops adjusted    🔖 {} IDs stamped".format(
-        agg["v_orphan"], agg["crop_adjusted"], agg["ids_stamped"]),
+    u"  ✂️ {} crops adjusted    🔖 {} IDs stamped".format(
+        agg["crop_adjusted"], agg["ids_stamped"]),
     u"  📄 {} viewports placed    🔄 {} viewports updated    📐 {} detail lines drawn".format(
         agg["vp_created"], agg["vp_updated"], agg["dl_created"]),
     u"  ❌ {} errors    ⚠ {} warnings".format(agg["errors"], agg["warnings"]),
@@ -882,9 +928,9 @@ for r in all_results:
         lines_out.append(u"      ⚠ SKIPPED: {}".format(r["skipped_reason"]))
         continue
     lines_out.append(
-        u"      views   created={}  updated={}  skipped={}  orphans={}  crops_adj={}  ids={}".format(
+        u"      views   created={}  updated={}  skipped={}  crops_adj={}  ids={}".format(
             r["v_created"], r["v_updated"], r["v_skipped"],
-            r["v_orphan"], r["crop_adjusted"], r["ids_stamped"]))
+            r["crop_adjusted"], r["ids_stamped"]))
     lines_out.append(
         u"      sheets  vp_created={}  vp_updated={}  dl_created={}  errors={}  warnings={}".format(
             r["vp_created"], r["vp_updated"], r["dl_created"],

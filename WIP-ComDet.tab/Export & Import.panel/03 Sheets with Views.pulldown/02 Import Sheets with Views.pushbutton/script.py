@@ -235,26 +235,68 @@ if _os.path.isfile(map_path):
     master_map_info = u"master_map.json: {} remapped ({})".format(remapped, map_dir)
 
 # ─────────────────────────────────────────────────────────────────────────────
-# 1d. Select which master views to import
+# 1d. Select which sheets to import
+#     The JSON's natural unit is the sheet — the user picks which sheets they
+#     want to bring across; the tool then derives the set of dependent views
+#     each picked sheet references and creates only those (under their
+#     matching masters).
 # ─────────────────────────────────────────────────────────────────────────────
 
-master_options = [
-    "{} ({} views)".format(mv["view_name"], len(mv["dependent_views"]))
-    for mv in data["master_views"]
-]
-chosen_masters = ui.pick_list(
-    master_options,
-    "2 of 5 — Select Master Views to Import",
-    multiselect=True,
-    context=u"Tick which masters from the JSON to bring into the active model. The "
-            u"dependent views under each master are created (or updated) under the "
-            u"matching master."
-)
-if not chosen_masters:
+sheets_in_json = data.get("sheets", [])
+if not sheets_in_json:
+    ui.alert(
+        u"This JSON has no 'sheets' section — nothing to import.\n\n"
+        u"Make sure it was exported with 'Export Sheets with Views' and "
+        u"that at least one sheet was selected during the export.",
+        title=u"Import Sheets with Views"
+    )
     script.exit()
 
-chosen_set          = {opt.split(" (")[0] for opt in chosen_masters}
-data["master_views"] = [mv for mv in data["master_views"] if mv["view_name"] in chosen_set]
+sheet_options = [
+    u"{} - {}  ({} views)".format(
+        sh["sheet_number"], sh.get("sheet_name", ""),
+        len(sh.get("viewports", [])))
+    for sh in sheets_in_json
+]
+chosen_sheet_opts = ui.pick_list(
+    sheet_options,
+    "2 of 5 — Select Sheets to Import",
+    multiselect=True,
+    context=u"Tick the sheets you want to bring into the active model. The tool "
+            u"figures out which dependent views each sheet needs and creates them "
+            u"automatically under their matching master views. Sheets you don't "
+            u"tick (and any views unique to them) are skipped entirely."
+)
+if not chosen_sheet_opts:
+    script.exit()
+
+# Filter data["sheets"] down to the chosen ones
+chosen_sheet_numbers = {opt.split(" - ", 1)[0] for opt in chosen_sheet_opts}
+data["sheets"] = [sh for sh in sheets_in_json
+                  if sh["sheet_number"] in chosen_sheet_numbers]
+
+# Derive the set of view_names referenced by viewports on chosen sheets
+required_view_names = set()
+for sh in data["sheets"]:
+    for vp in sh.get("viewports", []):
+        vn = vp.get("view_name")
+        if vn:
+            required_view_names.add(vn)
+
+# Filter master_views: keep only deps whose view_name is required, drop
+# masters that end up with no remaining deps. Orphans (placed_on_sheet=False)
+# don't appear in any sheet's viewports → naturally excluded.
+filtered_masters = []
+for mv in data["master_views"]:
+    kept_deps = [dv for dv in mv["dependent_views"]
+                 if dv["view_name"] in required_view_names]
+    if kept_deps:
+        filtered_masters.append({
+            "view_name":       mv["view_name"],
+            "view_scale":      mv.get("view_scale"),
+            "dependent_views": kept_deps,
+        })
+data["master_views"] = filtered_masters
 
 # ─────────────────────────────────────────────────────────────────────────────
 # 2. Strategy for existing dependent views
@@ -402,7 +444,6 @@ with revit.Transaction("Add Detail ID parameter"):
 total_v_created     = 0
 total_v_updated     = 0
 total_v_skipped     = 0
-total_v_orphan      = 0   # subset of created: dependents marked placed_on_sheet=False
 total_id_stamped    = 0
 total_crop_adjusted = 0   # Pass 3: AnnotationCropOffset 1/8" + CropBoxVisible=False
 view_results        = []   # (status, master_name, view_name, detail_str)
@@ -542,8 +583,6 @@ with ui.ProgressBar(title=u"Import Sheets with Views", cancellable=True, step=5)
                                             dv_id or u"—",
                                             title_on_sheet or u"(no title)")))
                     total_v_created += 1
-                    if dv_data.get("placed_on_sheet", True) is False:
-                        total_v_orphan += 1
                     existing_proj_names.add(final_name)
                     dep_view_by_name[final_name] = new_view   # make available for sheet phase
 
@@ -910,11 +949,6 @@ _BODY_XAML = u"""
             Visibility="Collapsed">
       <TextBlock x:Name="badgeCrop" Foreground="#B8A0E8" FontFamily="Segoe UI" FontSize="13"/>
     </Border>
-    <Border x:Name="badgeOrphanBorder" Background="#1A2238" BorderBrush="#8088A8"
-            BorderThickness="1" CornerRadius="4" Padding="10,4" Margin="0,0,8,0"
-            Visibility="Collapsed">
-      <TextBlock x:Name="badgeOrphan" Foreground="#8088A8" FontFamily="Segoe UI" FontSize="13"/>
-    </Border>
     <Border x:Name="badgeErrorBorder" Background="#3C1212" BorderBrush="#FF7070"
             BorderThickness="1" CornerRadius="4" Padding="10,4"
             Visibility="Collapsed">
@@ -1016,10 +1050,6 @@ if total_crop_adjusted:
     win.FindName("badgeCrop").Text = u"✂️  {} crops adjusted (1/8\" + hidden)".format(
         total_crop_adjusted)
 
-if total_v_orphan:
-    win.FindName("badgeOrphanBorder").Visibility = Visibility.Visible
-    win.FindName("badgeOrphan").Text = u"🌒  {} orphan view{} (unplaced)".format(
-        total_v_orphan, u"s" if total_v_orphan != 1 else u"")
 
 if n_errors:
     win.FindName("badgeErrorBorder").Visibility = Visibility.Visible
