@@ -1,5 +1,5 @@
 # -*- coding: utf-8 -*-
-__title__ = 'Export\nSheets with Views'
+__title__ = 'Export\nDetails'
 __doc__ = ('Bundles dependent views + sheet layout from this file into a single '
            'JSON. The JSON can later be imported into any other Revit file (or '
            'back into this one). Common Details is the coordinate hub — any '

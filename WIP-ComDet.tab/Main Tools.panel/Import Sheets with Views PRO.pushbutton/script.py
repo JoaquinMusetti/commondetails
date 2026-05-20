@@ -1,5 +1,5 @@
 # -*- coding: utf-8 -*-
-__title__ = 'Import\nSheets with Views PRO'
+__title__ = 'Import\nDetails PRO'
 __doc__ = ('Batch version of "Import Sheets with Views". Pick a JSON, choose '
            'which sheets to bring, then select multiple open Revit documents '
            '— the importer runs back-to-back on every doc with its own prefix '

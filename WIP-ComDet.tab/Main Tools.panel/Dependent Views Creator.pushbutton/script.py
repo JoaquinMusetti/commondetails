@@ -1,5 +1,5 @@
 # -*- coding: utf-8 -*-
-__title__ = 'Dependent\nViews Creator'
+__title__ = 'Create\nDetail Views'
 __doc__ = ('Creates dependent views from Detail Line rectangles drawn in the active view. '
            'Before running: draw rectangles with a reserved LineStyle and (optionally) place '
            'a TextNote inside each rectangle to name the dependent view. '

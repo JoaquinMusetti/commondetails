@@ -1,5 +1,5 @@
 # -*- coding: utf-8 -*-
-__title__ = 'Import\nSheets with Views'
+__title__ = 'Import\nDetails'
 __doc__ = ('Reads a Sheets with Views JSON (produced by "Export Sheets with '
            'Views") and recreates the dependent views + sheet layout in the '
            'active document. Direction-agnostic: works for CD->building, '
