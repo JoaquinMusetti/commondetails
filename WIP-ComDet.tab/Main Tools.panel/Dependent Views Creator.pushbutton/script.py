@@ -31,11 +31,14 @@ from Autodesk.Revit.DB import (
 
 doc   = revit.doc
 uidoc = revit.uidoc
+app   = revit.HOST_APP.app
 
 # Module-level notes list — used by helper functions to surface loose warnings
 # (loops that don't close, multiple TextNotes inside a rectangle, …).
 # Per-loop outcomes go into `results` inside main().
 notes = []
+
+ANNOTATION_CROP_OFFSET = 1.0 / 96.0   # 1/8" in Revit internal units (feet)
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -195,6 +198,111 @@ def make_crop_loop(bbox_viewspace, view_transform):
         loop.Append(Line.CreateBound(corners_world[k], corners_world[(k + 1) % 4]))
 
     return loop
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# HELPERS — Detail ID stamping (extracted from Assign Detail IDs)
+# ─────────────────────────────────────────────────────────────────────────────
+
+_SPF_PATH = _os.path.join(
+    _os.path.dirname(_os.path.dirname(_os.path.dirname(_os.path.dirname(
+        _os.path.abspath(__file__))))),
+    'lib', 'cucosync_shared_params.txt')
+
+
+def _patch_spf_varies(spf_path, param_name):
+    try:
+        with open(spf_path, 'r') as f:
+            lines = f.readlines()
+        new_lines = []
+        changed = False
+        for line in lines:
+            if line.startswith('PARAM\t'):
+                parts = line.rstrip('\r\n').split('\t')
+                if len(parts) >= 3 and parts[2] == param_name:
+                    while len(parts) < 10:
+                        parts.append('0')
+                    if parts[9] != '1':
+                        parts[9] = '1'
+                        line = '\t'.join(parts) + '\n'
+                        changed = True
+            new_lines.append(line)
+        if changed:
+            with open(spf_path, 'w') as f:
+                f.writelines(new_lines)
+        return changed
+    except Exception:
+        return False
+
+
+def _ensure_detail_id_param(doc, app):
+    _patch_spf_varies(_SPF_PATH, "Detail ID")
+    orig = app.SharedParametersFilename
+    app.SharedParametersFilename = _SPF_PATH
+    try:
+        spf = app.OpenSharedParameterFile()
+        if spf is None:
+            return False
+        grp = spf.Groups.get_Item("CucoSync") or spf.Groups.Create("CucoSync")
+        defn = grp.Definitions.get_Item("Detail ID")
+        if defn is None:
+            opts = DB.ExternalDefinitionCreationOptions("Detail ID", DB.SpecTypeId.String.Text)
+            opts.UserModifiable = True
+            opts.VariesAcrossGroups = True
+            defn = grp.Definitions.Create(opts)
+        from Autodesk.Revit.DB import BuiltInCategory
+        cat_set = app.Create.NewCategorySet()
+        cat = doc.Settings.Categories.get_Item(BuiltInCategory.OST_Views)
+        if cat:
+            cat_set.Insert(cat)
+        binding = app.Create.NewInstanceBinding(cat_set)
+        existing_key = None
+        is_instance  = False
+        it = doc.ParameterBindings.ForwardIterator()
+        while it.MoveNext():
+            if it.Key.Name == "Detail ID":
+                existing_key = it.Key
+                is_instance  = isinstance(it.Current, DB.InstanceBinding)
+                break
+        from Autodesk.Revit.DB import BuiltInParameterGroup
+        if existing_key is None:
+            doc.ParameterBindings.Insert(defn, binding, BuiltInParameterGroup.PG_IDENTITY_DATA)
+        elif is_instance:
+            doc.ParameterBindings.ReInsert(defn, binding, BuiltInParameterGroup.PG_IDENTITY_DATA)
+        else:
+            doc.ParameterBindings.Remove(existing_key)
+            doc.ParameterBindings.Insert(defn, binding, BuiltInParameterGroup.PG_IDENTITY_DATA)
+        return True
+    finally:
+        app.SharedParametersFilename = orig
+
+
+def _get_detail_id(view):
+    p = view.LookupParameter("Detail ID")
+    return (p.AsString() or u"") if p else u""
+
+
+def _next_available_id(all_dep_views):
+    max_id = 0
+    for v in all_dep_views:
+        val = _get_detail_id(v)
+        if val:
+            try:
+                max_id = max(max_id, int(val))
+            except ValueError:
+                pass
+    return max_id + 1
+
+
+def _stamp_detail_id(view, value):
+    p = view.LookupParameter("Detail ID")
+    if p is None or p.IsReadOnly:
+        return False
+    try:
+        p.Set(value)
+        return True
+    except Exception:
+        return False
 
 
 def next_available_name(base, existing):
@@ -368,11 +476,12 @@ def main():
 
     # Per-loop results: list of (status, view_name, source, size_str)
     #   status ∈ {"created", "renamed", "skipped", "error"}
-    results  = []
-    created  = 0
-    renamed  = 0
-    skipped  = 0
-    errors   = 0
+    results    = []
+    created    = 0
+    renamed    = 0
+    skipped    = 0
+    errors     = 0
+    new_views  = []   # view objects for created/renamed views (for Detail ID stamping)
 
     # Elements to clean up after creation. We only delete the DetailLines and
     # TextNotes belonging to loops that were actually created/renamed/skipped.
@@ -450,6 +559,23 @@ def main():
             crop_manager = new_view.GetCropRegionShapeManager()
             crop_manager.SetCropShape(crop_loop)
 
+            # Auto-apply annotation crop offset (1/8") and hide crop boundary
+            try:
+                rm = new_view.GetCropRegionShapeManager()
+                try:
+                    rm.TopAnnotationCropOffset    = ANNOTATION_CROP_OFFSET
+                    rm.BottomAnnotationCropOffset = ANNOTATION_CROP_OFFSET
+                    rm.LeftAnnotationCropOffset   = ANNOTATION_CROP_OFFSET
+                    rm.RightAnnotationCropOffset  = ANNOTATION_CROP_OFFSET
+                except Exception:
+                    rm.SetAnnotationCropOffset(
+                        ANNOTATION_CROP_OFFSET, ANNOTATION_CROP_OFFSET,
+                        ANNOTATION_CROP_OFFSET, ANNOTATION_CROP_OFFSET)
+                if new_view.CropBoxVisible:
+                    new_view.CropBoxVisible = False
+            except Exception as ex:
+                notes.append(u"Could not apply crop offset to '{}': {}".format(final_name, ex))
+
             if was_renamed:
                 results.append((
                     "renamed", final_name,
@@ -460,6 +586,7 @@ def main():
             else:
                 results.append(("created", final_name, source, size_str))
             created += 1
+            new_views.append(new_view)
             # Successful create → rectangle + label are no longer needed
             lines_to_delete.extend(loop_line_ids)
             textnotes_to_delete.extend(found_tn_ids)
@@ -477,16 +604,17 @@ def main():
         t.Commit()
 
     return {
-        "master_name":     master_name,
+        "master_name":      master_name,
         "chosen_linestyle": chosen_linestyle,
-        "chosen_tn_type":  chosen_tn_type,
-        "n_loops":         len(loops),
-        "results":         results,
-        "created":         created,
-        "renamed":         renamed,
-        "skipped":         skipped,
-        "errors":          errors,
-        "deleted":         deleted_count,
+        "chosen_tn_type":   chosen_tn_type,
+        "n_loops":          len(loops),
+        "results":          results,
+        "created":          created,
+        "renamed":          renamed,
+        "skipped":          skipped,
+        "errors":           errors,
+        "deleted":          deleted_count,
+        "new_views":        new_views,
     }
 
 
@@ -509,20 +637,23 @@ class _Row(object):
         "skipped": u"⏭  Skipped",
         "error":   u"❌  Error",
     }
-    def __init__(self, status, name, source, size):
-        self._status = status
-        self._name   = name
-        self._source = source
-        self._size   = size
+    def __init__(self, status, name, source, size, detail_id=u"—"):
+        self._status    = status
+        self._name      = name
+        self._source    = source
+        self._size      = size
+        self._detail_id = detail_id
 
     @property
-    def Status(self):   return self._LABELS.get(self._status, self._status)
+    def Status(self):    return self._LABELS.get(self._status, self._status)
     @property
-    def ViewName(self): return self._name
+    def ViewName(self):  return self._name
     @property
-    def Source(self):   return self._source
+    def Source(self):    return self._source
     @property
-    def Size(self):     return self._size
+    def Size(self):      return self._size
+    @property
+    def DetailID(self):  return self._detail_id
 
 
 _BODY_XAML = u"""
@@ -555,6 +686,11 @@ _BODY_XAML = u"""
             BorderThickness="1" CornerRadius="4" Padding="10,4" Margin="0,0,8,0"
             Visibility="Collapsed">
       <TextBlock x:Name="badgeDeleted" Foreground="#64748B" FontFamily="Segoe UI" FontSize="13"/>
+    </Border>
+    <Border x:Name="badgeStampedBorder" Background="#1A2B3C" BorderBrush="#60A5FA"
+            BorderThickness="1" CornerRadius="4" Padding="10,4" Margin="0,0,8,0"
+            Visibility="Collapsed">
+      <TextBlock x:Name="badgeStamped" Foreground="#60A5FA" FontFamily="Segoe UI" FontSize="13"/>
     </Border>
     <Border x:Name="badgeNotesBorder" Background="#4A3810" BorderBrush="#FFCC66"
             BorderThickness="1" CornerRadius="4" Padding="10,4"
@@ -609,6 +745,7 @@ _BODY_XAML = u"""
       <DataGridTextColumn Header="View Name" Binding="{Binding ViewName}" Width="*"/>
       <DataGridTextColumn Header="Source"    Binding="{Binding Source}"   Width="280"/>
       <DataGridTextColumn Header="Size"      Binding="{Binding Size}"     Width="130"/>
+      <DataGridTextColumn Header="Detail ID" Binding="{Binding DetailID}" Width="90"/>
     </DataGrid.Columns>
   </DataGrid>
 </Grid>
@@ -626,7 +763,9 @@ _FOOTER_XAML = u"""
 """
 
 
-def show_results(summary):
+def show_results(summary, id_map=None):
+    if id_map is None:
+        id_map = {}
     master_name = summary["master_name"]
     results     = summary["results"]
     created     = summary["created"]
@@ -634,6 +773,7 @@ def show_results(summary):
     skipped     = summary["skipped"]
     errors      = summary["errors"]
     n_loops     = summary["n_loops"]
+    stamped     = summary.get("stamped", 0)
 
     subtitle = u"Active view: {}  ·  LineStyle: {}  ·  {} loop{}".format(
         master_name, summary["chosen_linestyle"],
@@ -641,10 +781,11 @@ def show_results(summary):
 
     rows = ObservableCollection[_Row]()
     for status, name, source, size in results:
-        rows.Add(_Row(status, name, source, size))
+        detail_id = id_map.get(name, u"—") if status in ("created", "renamed") else u"—"
+        rows.Add(_Row(status, name, source, size, detail_id))
 
     win = ui.parse(u"Dependent Views Creator", subtitle,
-                   _BODY_XAML, _FOOTER_XAML, width=960, height=560)
+                   _BODY_XAML, _FOOTER_XAML, width=1060, height=560)
 
     win.FindName("badgeCreated").Text = u"✅  {} created".format(created)
     if renamed:
@@ -660,6 +801,10 @@ def show_results(summary):
     if summary["deleted"]:
         win.FindName("badgeDeletedBorder").Visibility = Visibility.Visible
         win.FindName("badgeDeleted").Text = u"🗑  {} cleaned up".format(summary["deleted"])
+    if stamped:
+        win.FindName("badgeStampedBorder").Visibility = Visibility.Visible
+        win.FindName("badgeStamped").Text = u"🏷  {} ID{}".format(
+            stamped, u"s" if stamped != 1 else u"")
     if notes:
         win.FindName("badgeNotesBorder").Visibility = Visibility.Visible
         win.FindName("badgeNotes").Text = u"⚠️  {} note{}".format(
@@ -670,8 +815,8 @@ def show_results(summary):
     def on_copy(s, e):
         out = [u"Dependent Views Creator — " + subtitle, u""]
         for r in rows:
-            out.append(u"{}  |  {}  |  {}  |  {}".format(
-                r.Status, r.ViewName, r.Source, r.Size))
+            out.append(u"{}  |  {}  |  {}  |  {}  |  {}".format(
+                r.Status, r.ViewName, r.Source, r.Size, r.DetailID))
         if notes:
             out.append(u"")
             out.append(u"Notes:")
@@ -686,5 +831,56 @@ def show_results(summary):
 
 
 summary = main()
-if summary is not None:
-    show_results(summary)
+if summary is None:
+    script.exit()
+
+id_map  = {}
+stamped = 0
+new_views = summary.get("new_views", [])
+
+if new_views:
+    do_stamp = ui.confirm(
+        u"Do you want to assign Detail IDs to the {} new view{}?".format(
+            len(new_views), u"s" if len(new_views) != 1 else u""),
+        title=u"Assign Detail IDs",
+        context=(
+            u"Detail IDs are used to match views across models during Export and Import. "
+            u"Only assign them if you're working in Common Details — assigning IDs in a "
+            u"building model may cause duplicates when syncing with Common Details."
+        )
+    )
+    if do_stamp:
+        # Ensure the shared parameter is loaded
+        with Transaction(doc, "Add Detail ID parameter") as _t:
+            _t.Start()
+            _ensure_detail_id_param(doc, app)
+            _t.Commit()
+        # Collect all dep views to find the next available ID
+        _all_views = FilteredElementCollector(doc).OfClass(DB.View).ToElements()
+        _dep_views = [v for v in _all_views
+                      if not v.IsTemplate
+                      and v.GetPrimaryViewId() != DB.ElementId.InvalidElementId]
+        next_id = _next_available_id(_dep_views)
+        with Transaction(doc, "Assign Detail IDs") as _t:
+            _t.Start()
+            for _v in sorted(new_views, key=lambda x: x.Name):
+                _id_str = u"{:04d}".format(next_id)
+                if _stamp_detail_id(_v, _id_str):
+                    id_map[_v.Name] = _id_str
+                    next_id += 1
+                    stamped += 1
+            _t.Commit()
+    else:
+        ui.alert(
+            u"Detail IDs were not assigned.\n\n"
+            u"If you created these views outside Common Details, make sure to transfer "
+            u"them to the Common Details file before running Export or Import.\n\n"
+            u"The best approach for this workflow is to always author content in Common "
+            u"Details. If you are working on custom details, organize them on your sheets "
+            u"first — then transfer everything to Common Details so it becomes the single "
+            u"source of truth for all buildings.",
+            title=u"Workflow Reminder"
+        )
+
+summary["stamped"] = stamped
+show_results(summary, id_map)

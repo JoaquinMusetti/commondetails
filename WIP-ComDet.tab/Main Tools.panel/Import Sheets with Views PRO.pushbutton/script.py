@@ -692,20 +692,37 @@ def import_one_doc(target_doc, dest_prefix, link_instance_name, data_in, pb, tot
 
         target_sheet     = sheet_by_suffix[suffix]
         vp_id_to_det_num = {}
+        original_numbers = {}
 
-        # T1: viewports + lines
+        # ══ T0: free up detail-number namespace ═════════════════════════════
+        if DO_DET_NUMBER:
+            t0 = DB.Transaction(target_doc,
+                                "Import PRO T0 — {} / {}".format(
+                                    target_doc.Title, sheet_label))
+            try:
+                t0.Start()
+                _vps_t0 = list(DB.FilteredElementCollector(target_doc, target_sheet.Id)
+                               .OfClass(DB.Viewport).ToElements())
+                original_numbers = {sv.Id.IntegerValue: get_detail_number(sv)
+                                    for sv in _vps_t0}
+                _ts0 = str(int(time.time()))
+                for _idx, sv in enumerate(_vps_t0):
+                    set_detail_number(sv, "zzz{}_{}".format(_ts0, _idx))
+                t0.Commit()
+            except Exception:
+                try:
+                    if t0.HasStarted() and not t0.HasEnded():
+                        t0.RollBack()
+                except Exception:
+                    pass
+                res["errors"] += 1
+                continue
+
+        # ══ T1: viewports + lines ═══════════════════════════════════════════
         t1 = DB.Transaction(target_doc, "Import PRO T1 — {} / {}".format(
             target_doc.Title, sheet_label))
         try:
             t1.Start()
-            all_sheet_vps_t1 = list(DB.FilteredElementCollector(target_doc, target_sheet.Id)
-                                    .OfClass(DB.Viewport).ToElements())
-            original_numbers = {sv.Id.IntegerValue: get_detail_number(sv)
-                                 for sv in all_sheet_vps_t1}
-            timestamp = str(int(time.time()))
-            for idx, sv in enumerate(all_sheet_vps_t1):
-                set_detail_number(sv, "zzz{}_{}".format(timestamp, idx))
-            processed_vp_ids = []
 
             for entry in sheet_data["viewports"]:
                 view_name   = entry["view_name"]
@@ -749,7 +766,6 @@ def import_one_doc(target_doc, dest_prefix, link_instance_name, data_in, pb, tot
                                         pass
                             if DO_DET_NUMBER and target_det:
                                 vp_id_to_det_num[existing_vp.Id.IntegerValue] = target_det
-                            processed_vp_ids.append(existing_vp.Id.IntegerValue)
                             res["vp_updated"] += 1
                         else:
                             res["warnings"] += 1
@@ -781,16 +797,9 @@ def import_one_doc(target_doc, dest_prefix, link_instance_name, data_in, pb, tot
                                 pass
                         if DO_DET_NUMBER and target_det:
                             vp_id_to_det_num[vp.Id.IntegerValue] = target_det
-                        processed_vp_ids.append(vp.Id.IntegerValue)
                         res["vp_created"] += 1
                 except Exception:
                     res["errors"] += 1
-
-            for sv in all_sheet_vps_t1:
-                if sv.Id.IntegerValue not in processed_vp_ids:
-                    orig = original_numbers.get(sv.Id.IntegerValue, "")
-                    if orig:
-                        set_detail_number(sv, orig)
 
             if DO_LINES:
                 dl_data = sheet_data.get("detail_lines", [])
@@ -834,7 +843,7 @@ def import_one_doc(target_doc, dest_prefix, link_instance_name, data_in, pb, tot
             res["errors"] += 1
             continue
 
-        # T2: assign final detail numbers
+        # ══ T2: assign final detail numbers ═════════════════════════════════
         if not DO_DET_NUMBER or not vp_id_to_det_num:
             continue
         t2 = DB.Transaction(target_doc, "Import PRO T2 — {} / {}".format(
@@ -847,9 +856,14 @@ def import_one_doc(target_doc, dest_prefix, link_instance_name, data_in, pb, tot
             for idx, sv in enumerate(all_sheet_vps_t2):
                 set_detail_number(sv, "zzz{}_{}".format(ts2, idx))
             for sv in all_sheet_vps_t2:
-                det_num = vp_id_to_det_num.get(sv.Id.IntegerValue)
+                vid     = sv.Id.IntegerValue
+                det_num = vp_id_to_det_num.get(vid)
                 if det_num:
                     set_detail_number(sv, det_num)
+                elif vid in original_numbers:
+                    orig = original_numbers[vid]
+                    if orig:
+                        set_detail_number(sv, orig)
             t2.Commit()
         except Exception:
             try:

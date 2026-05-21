@@ -215,9 +215,10 @@ else:
 # 1c. Apply master_map.json
 # ─────────────────────────────────────────────────────────────────────────────
 
-map_path       = _os.path.join(_os.path.dirname(json_path), "master_map.json")
+map_path        = _os.path.join(_os.path.dirname(json_path), "master_map.json")
+master_map_loaded = _os.path.isfile(map_path)
 master_map_info = u""
-if _os.path.isfile(map_path):
+if master_map_loaded:
     with open(map_path, "r") as f:
         raw_map = json.load(f)
     if link_transform is None:
@@ -299,6 +300,13 @@ for mv in data["master_views"]:
         })
 data["master_views"] = filtered_masters
 
+# Reverse-lookup used for diagnostic messages in Phase B
+view_name_to_master = {
+    dv["view_name"]: mv["view_name"]
+    for mv in data["master_views"]
+    for dv in mv["dependent_views"]
+}
+
 # ─────────────────────────────────────────────────────────────────────────────
 # 2. Strategy for existing dependent views
 # ─────────────────────────────────────────────────────────────────────────────
@@ -371,9 +379,10 @@ dest_prefix = dest_prefix.strip().upper()
 
 all_views_dest = DB.FilteredElementCollector(doc).OfClass(DB.View).ToElements()
 
-view_by_name     = {}
-template_by_name = {}
-dep_view_by_name = {}
+view_by_name      = {}
+template_by_name  = {}
+dep_view_by_name  = {}
+view_by_detail_id = {}   # global Detail ID → dependent view (for pre-flight precedence)
 
 for v in all_views_dest:
     try:
@@ -384,6 +393,9 @@ for v in all_views_dest:
             pid = v.GetPrimaryViewId()
             if pid != DB.ElementId.InvalidElementId:
                 dep_view_by_name[v.Name] = v
+                _did = get_detail_id(v)
+                if _did:
+                    view_by_detail_id[_did] = v
     except Exception:
         pass
 
@@ -439,6 +451,330 @@ with revit.Transaction("Add Detail ID parameter"):
     ensure_detail_id_param(doc, HOST_APP.app)
 
 # ─────────────────────────────────────────────────────────────────────────────
+# 5c. Pre-flight: type / scale / name mismatch check with optional auto-fix
+# ─────────────────────────────────────────────────────────────────────────────
+# Precedence per JSON dep entry:
+#   1. exact match (ID + name)   → canonical, only check type/scale
+#   2. ID-only match (name differs)  → name mismatch + type/scale check
+#   3. name-only match           → type/scale check
+#   4. nothing                    → new view, Phase A will create it
+# Fix actions (chosen via checkboxes):
+#   type/scale: delete the dep, Phase A recreates from the correct master
+#   name:       rename in destination; if name is taken, collider → "<name> (old)"
+
+from System.Collections.ObjectModel import ObservableCollection as _OC_PF
+
+_VT_LABEL = {
+    int(DB.ViewType.FloorPlan):    u"Floor Plan",
+    int(DB.ViewType.CeilingPlan):  u"Ceiling Plan",
+    int(DB.ViewType.Section):      u"Section",
+    int(DB.ViewType.Elevation):    u"Elevation",
+    int(DB.ViewType.DraftingView): u"Drafting",
+    int(DB.ViewType.Detail):       u"Detail",
+    int(DB.ViewType.AreaPlan):     u"Area Plan",
+    int(DB.ViewType.ThreeD):       u"3D",
+}
+
+def _vt_label(v):
+    try:
+        return _VT_LABEL.get(int(v.ViewType), str(v.ViewType))
+    except Exception:
+        return u"?"
+
+
+class _PFRow(object):
+    def __init__(self, icon, view_name, issue, in_model, in_json):
+        self._icon      = icon
+        self._view_name = view_name
+        self._issue     = issue
+        self._in_model  = in_model
+        self._in_json   = in_json
+
+    @property
+    def Icon(self):     return self._icon
+    @property
+    def ViewName(self): return self._view_name
+    @property
+    def Issue(self):    return self._issue
+    @property
+    def InModel(self):  return self._in_model
+    @property
+    def InJSON(self):   return self._in_json
+
+
+_pf_rows       = _OC_PF[_PFRow]()
+_pf_type_ids   = []   # ElementIds with type mismatch — candidates for delete
+_pf_scale_ids  = []   # ElementIds with scale mismatch — candidates for delete
+_pf_name_fixes = []   # [(ElementId, new_name)] — candidates for rename
+
+# Counters populated when fixes actually execute (used by results window badges)
+n_type_fixed   = 0
+n_scale_fixed  = 0
+n_renamed      = 0
+n_old_marked   = 0
+name_fix_errors = []   # [(view_id_str, error_msg)] for results window Issues section
+
+for _mv in data["master_views"]:
+    _mname = _mv["view_name"]
+    if _mname not in view_by_name:
+        continue   # master missing — Phase A will report as skip_master
+    _mview = view_by_name[_mname]
+
+    for _dv in _mv["dependent_views"]:
+        _dv_name    = _dv["view_name"]
+        _dv_id      = _dv.get("detail_id", "")
+        _json_scale = _dv.get("view_scale", _mview.Scale)
+
+        # ── Precedence: exact (ID+name) > ID-only > name-only ────────────────
+        _ex = None
+        _has_name_mismatch = False
+
+        if _dv_id:
+            _by_id = view_by_detail_id.get(_dv_id)
+            if _by_id is not None:
+                if _by_id.Name == _dv_name:
+                    _ex = _by_id                  # exact match — canonical
+                else:
+                    _ex = _by_id                  # ID match, name differs
+                    _has_name_mismatch = True
+
+        if _ex is None:
+            _ex = dep_view_by_name.get(_dv_name)  # name-only match
+
+        if _ex is None:
+            continue   # new view — Phase A will create it
+
+        # ── Structural mismatch: type takes precedence over scale ─────────────
+        will_be_deleted = False
+        try:
+            if _ex.ViewType != _mview.ViewType:
+                _pf_rows.Add(_PFRow(
+                    u"⛔", _dv_name, u"Type changed",
+                    _vt_label(_ex), _vt_label(_mview)
+                ))
+                _pf_type_ids.append(_ex.Id)
+                will_be_deleted = True
+            elif _ex.Scale != _json_scale:
+                _pf_rows.Add(_PFRow(
+                    u"⚠", _dv_name, u"Scale changed",
+                    u"1 : {}".format(_ex.Scale),
+                    u"1 : {}".format(_json_scale)
+                ))
+                _pf_scale_ids.append(_ex.Id)
+                will_be_deleted = True
+        except Exception:
+            pass
+
+        # Name mismatch only matters if the view will SURVIVE Phase A
+        # (a deleted view doesn't need its name fixed — Phase A recreates with JSON name)
+        if _has_name_mismatch and not will_be_deleted:
+            _pf_rows.Add(_PFRow(
+                u"✏", _dv_name, u"Name mismatch", _ex.Name, _dv_name
+            ))
+            _pf_name_fixes.append((_ex.Id, _dv_name))
+
+# ── Modal + fix transactions ────────────────────────────────────────────────
+if len(_pf_rows) > 0:
+    _n_type  = sum(1 for _r in _pf_rows if _r.Issue == u"Type changed")
+    _n_scale = sum(1 for _r in _pf_rows if _r.Issue == u"Scale changed")
+    _n_name  = sum(1 for _r in _pf_rows if _r.Issue == u"Name mismatch")
+    _pf_parts = []
+    if _n_type:  _pf_parts.append(u"{} type".format(_n_type))
+    if _n_scale: _pf_parts.append(u"{} scale".format(_n_scale))
+    if _n_name:  _pf_parts.append(u"{} name".format(_n_name))
+
+    _PF_BODY = u"""
+<Grid>
+  <Grid.RowDefinitions>
+    <RowDefinition Height="*"/>
+    <RowDefinition Height="Auto"/>
+  </Grid.RowDefinitions>
+  <DataGrid Grid.Row="0" x:Name="dgPF" AutoGenerateColumns="False"
+            IsReadOnly="True" CanUserResizeColumns="True" CanUserSortColumns="True"
+            Background="#12131F" Foreground="#E8EBF5"
+            BorderBrush="#2A2D47" BorderThickness="1"
+            RowBackground="#12131F" AlternatingRowBackground="#0E0F1A"
+            HorizontalGridLinesBrush="#1A1D30" VerticalGridLinesBrush="#1A1D30"
+            ColumnHeaderHeight="28" FontFamily="Segoe UI" FontSize="12"
+            HeadersVisibility="Column">
+    <DataGrid.ColumnHeaderStyle>
+      <Style TargetType="DataGridColumnHeader">
+        <Setter Property="Background" Value="#1E2235"/>
+        <Setter Property="Foreground" Value="#9099C8"/>
+        <Setter Property="FontFamily" Value="Segoe UI"/>
+        <Setter Property="FontSize"   Value="11"/>
+        <Setter Property="Padding"    Value="8,0"/>
+      </Style>
+    </DataGrid.ColumnHeaderStyle>
+    <DataGrid.Columns>
+      <DataGridTextColumn Header=""         Binding="{Binding Icon}"    Width="28"/>
+      <DataGridTextColumn Header="View"     Binding="{Binding ViewName}" Width="*"/>
+      <DataGridTextColumn Header="Issue"    Binding="{Binding Issue}"   Width="130"/>
+      <DataGridTextColumn Header="In model" Binding="{Binding InModel}" Width="150"/>
+      <DataGridTextColumn Header="In JSON"  Binding="{Binding InJSON}"  Width="150"/>
+    </DataGrid.Columns>
+  </DataGrid>
+  <StackPanel Grid.Row="1" Margin="0,14,0,0">
+    <CheckBox x:Name="chkFixType"  Visibility="Collapsed" IsChecked="True"
+              Foreground="#E8EBF5" FontFamily="Segoe UI" FontSize="12" Margin="0,2,0,2"
+              Content="⛔  Fix type mismatches — delete the old dependent, Phase A recreates it from the correct master"/>
+    <CheckBox x:Name="chkFixScale" Visibility="Collapsed" IsChecked="True"
+              Foreground="#E8EBF5" FontFamily="Segoe UI" FontSize="12" Margin="0,2,0,2"
+              Content="⚠  Fix scale mismatches — delete the old dependent, Phase A recreates it from the correct-scale master"/>
+    <CheckBox x:Name="chkFixName"  Visibility="Collapsed" IsChecked="True"
+              Foreground="#E8EBF5" FontFamily="Segoe UI" FontSize="12" Margin="0,2,0,2"
+              Content="✏  Fix name mismatches — rename destination view to match the source name (any colliding view gets a '(old)' suffix)"/>
+  </StackPanel>
+</Grid>
+"""
+
+    _PF_FOOTER = u"""
+<Grid>
+  <StackPanel HorizontalAlignment="Left" Orientation="Horizontal">
+    <Button x:Name="btnPFAbort"   Content="Abort" Style="{StaticResource BtnGhost}"/>
+  </StackPanel>
+  <StackPanel HorizontalAlignment="Right" Orientation="Horizontal">
+    <Button x:Name="btnPFProceed" Content="Proceed" Style="{StaticResource BtnPrimary}"/>
+  </StackPanel>
+</Grid>
+"""
+
+    _pf_win = ui.parse(
+        u"Pre-flight — Mismatched Views",
+        u"⚠  " + u"  \xb7  ".join(_pf_parts) + u" mismatch" + (u"es" if (_n_type + _n_scale + _n_name) > 1 else u""),
+        _PF_BODY, _PF_FOOTER,
+        width=920, height=560,
+        context=u"Tick the fix boxes you want to apply before the import runs. "
+                u"Type/scale fixes delete the old dependent so Phase A recreates it from "
+                u"the correct master. Name fix renames the destination view to match the "
+                u"source — if another view already has that name, the colliding view is "
+                u"renamed to '<name> (old)'."
+    )
+    _pf_win.FindName("dgPF").ItemsSource = _pf_rows
+
+    from System.Windows import Visibility as _PFVis
+    if _n_type:  _pf_win.FindName("chkFixType").Visibility  = _PFVis.Visible
+    if _n_scale: _pf_win.FindName("chkFixScale").Visibility = _PFVis.Visible
+    if _n_name:  _pf_win.FindName("chkFixName").Visibility  = _PFVis.Visible
+
+    _pf_proceed = [False]
+
+    def _on_pf_proceed(s, e, _w=_pf_win, _c=_pf_proceed):
+        _c[0] = True
+        _w.Close()
+
+    _pf_win.FindName("btnPFProceed").Click += _on_pf_proceed
+    _pf_win.FindName("btnPFAbort").Click   += lambda s, e, _w=_pf_win: _w.Close()
+
+    # Capture checkbox state BEFORE closing the window (FindName fails after Close)
+    _fix_type_chk  = _pf_win.FindName("chkFixType")
+    _fix_scale_chk = _pf_win.FindName("chkFixScale")
+    _fix_name_chk  = _pf_win.FindName("chkFixName")
+
+    _pf_win.ShowDialog()
+
+    if not _pf_proceed[0]:
+        script.exit()
+
+    _fix_type  = _n_type  > 0 and bool(_fix_type_chk.IsChecked)
+    _fix_scale = _n_scale > 0 and bool(_fix_scale_chk.IsChecked)
+    _fix_name  = _n_name  > 0 and bool(_fix_name_chk.IsChecked)
+
+    # ── Fix tx 1: delete master-mismatched views (type + scale combined) ────
+    _delete_ids = []
+    if _fix_type:  _delete_ids += _pf_type_ids
+    if _fix_scale: _delete_ids += _pf_scale_ids
+
+    if _delete_ids:
+        with revit.Transaction("Import — Delete master-mismatched views"):
+            for _eid in _delete_ids:
+                try:
+                    doc.Delete(_eid)
+                    if _eid in _pf_type_ids:  n_type_fixed  += 1
+                    if _eid in _pf_scale_ids: n_scale_fixed += 1
+                except Exception as _e:
+                    name_fix_errors.append((str(_eid.IntegerValue),
+                                            u"Delete failed: {}".format(_e)))
+
+    # ── Fix tx 2: rename name-mismatched views with collision-to-(old) ──────
+    if _fix_name and _pf_name_fixes:
+
+        def _name_taken(name, exclude_id=None):
+            for _v in DB.FilteredElementCollector(doc).OfClass(DB.View).ToElements():
+                try:
+                    if exclude_id is not None and _v.Id == exclude_id:
+                        continue
+                    if not _v.IsTemplate and _v.Name == name:
+                        return True
+                except Exception:
+                    pass
+            return False
+
+        def _apply_name_fix(eid, new_name):
+            v = doc.GetElement(eid)
+            if v is None:
+                return ("missing", None)
+            collider = None
+            for other in DB.FilteredElementCollector(doc).OfClass(DB.View).ToElements():
+                try:
+                    if other.Id != v.Id and not other.IsTemplate and other.Name == new_name:
+                        collider = other
+                        break
+                except Exception:
+                    pass
+            collider_renamed_to = None
+            if collider is not None:
+                candidate = u"{} (old)".format(new_name)
+                _n = 2
+                while _name_taken(candidate, exclude_id=collider.Id):
+                    candidate = u"{} (old {})".format(new_name, _n)
+                    _n += 1
+                try:
+                    collider.Name = candidate
+                    collider_renamed_to = candidate
+                except Exception as _ce:
+                    return ("collider_rename_failed", str(_ce))
+            try:
+                v.Name = new_name
+                return ("ok", collider_renamed_to)
+            except Exception as _re:
+                return ("rename_failed", str(_re))
+
+        with revit.Transaction("Import — Fix name mismatches"):
+            for _eid, _new_name in _pf_name_fixes:
+                _status, _collider_new = _apply_name_fix(_eid, _new_name)
+                if _status == "ok":
+                    n_renamed += 1
+                    if _collider_new is not None:
+                        n_old_marked += 1
+                else:
+                    name_fix_errors.append((_new_name, u"{}: {}".format(_status, _collider_new or u"")))
+
+    # ── Rebuild stale indices if anything was changed ───────────────────────
+    if _delete_ids or (_fix_name and _pf_name_fixes):
+        view_by_name      = {}
+        template_by_name  = {}
+        dep_view_by_name  = {}
+        view_by_detail_id = {}
+        for _v in DB.FilteredElementCollector(doc).OfClass(DB.View).ToElements():
+            try:
+                view_by_name[_v.Name] = _v
+                if _v.IsTemplate:
+                    template_by_name[_v.Name] = _v.Id
+                else:
+                    if _v.GetPrimaryViewId() != DB.ElementId.InvalidElementId:
+                        dep_view_by_name[_v.Name] = _v
+                        _did = get_detail_id(_v)
+                        if _did:
+                            view_by_detail_id[_did] = _v
+            except Exception:
+                pass
+        existing_proj_names = set(view_by_name.keys())
+        viewport_by_view_id = {}
+        for _vp in DB.FilteredElementCollector(doc).OfClass(DB.Viewport).ToElements():
+            viewport_by_view_id[_vp.ViewId.IntegerValue] = _vp
+
+# ─────────────────────────────────────────────────────────────────────────────
 # 6. Import views (two-pass: all Duplicate calls, then all SetCropShape calls)
 # ─────────────────────────────────────────────────────────────────────────────
 
@@ -450,6 +786,16 @@ total_crop_adjusted = 0   # Pass 3: AnnotationCropOffset 1/8" + CropBoxVisible=F
 view_results        = []   # (status, master_name, view_name, detail_str)
 cancelled           = False
 
+# Maps JSON dep view_name → actual Revit view object, populated in Phase A.
+# Phase B uses this so it still finds the view even when:
+#   • Phase A matched by detail_id but the destination view has a different name
+#   • Phase A renamed the created view to avoid a name collision ("Name (2)", etc.)
+phase_a_lookup = {}
+
+# Maps JSON dep view_name → (icon, action_label, detail) for the grouped results UI.
+# Populated alongside phase_a_lookup so section 7 can show per-view Phase A outcome.
+phase_a_result_by_view = {}   # dv_name → (icon_str, action_str, detail_str)
+
 # 1/8" expressed in Revit internal units (feet). 1/8 in ÷ 12 in/ft = 1/96 ft.
 ANNOTATION_CROP_OFFSET = 1.0 / 96.0
 
@@ -457,6 +803,23 @@ total_views = sum(len(mv["dependent_views"]) for mv in data["master_views"])
 processed   = 0
 
 sheets_data = data.get("sheets", [])
+
+# ── Unload CD link "for me" before the import loop ──────────────────────────
+# Matches Full Sync PRO behaviour: temporarily unload the linked model for the
+# current user so Revit doesn't recompute link geometry on every view operation.
+# Only done when importing into a building (link_transform is not None).
+_cd_link_type      = None
+_link_was_unloaded = False
+if link_transform is not None:
+    try:
+        _cd_link_inst = link_by_name.get(chosen_link)
+        if _cd_link_inst is not None:
+            _cd_link_type = doc.GetElement(_cd_link_inst.GetTypeId())
+            if _cd_link_type is not None:
+                _cd_link_type.UnloadLocally(None)
+                _link_was_unloaded = True
+    except Exception:
+        pass   # Non-critical — if unload fails, continue without it
 
 with ui.ProgressBar(title=u"Import Sheets with Views", cancellable=True, step=5) as pb:
     pb.update_progress(0, total_views + len(sheets_data))
@@ -467,7 +830,16 @@ with ui.ProgressBar(title=u"Import Sheets with Views", cancellable=True, step=5)
             view_name = view_data["view_name"]
 
             if view_name not in view_by_name:
-                view_results.append(("skip_master", view_name, "", ""))
+                if master_map_loaded:
+                    _mmj_hint = (u"master_map.json is present but '{}' was not remapped — "
+                                 u"add an entry for it").format(view_name)
+                else:
+                    _mmj_hint = (u"no master_map.json found next to the JSON — "
+                                 u"create one to remap source names to destination names")
+                view_results.append((
+                    "skip_master", view_name, u"—",
+                    u"Master '{}' not in this model  •  {}".format(view_name, _mmj_hint)
+                ))
                 continue
 
             master_view = view_by_name[view_name]
@@ -512,6 +884,11 @@ with ui.ProgressBar(title=u"Import Sheets with Views", cancellable=True, step=5)
 
                 # Already exists
                 if existing_view is not None:
+                    # Register under the JSON name so Phase B can find it even if
+                    # the destination view has a different name (e.g. matched by
+                    # detail_id but renamed in the destination model).
+                    phase_a_lookup[dv_name] = existing_view
+
                     if dv_id and not get_detail_id(existing_view):
                         set_detail_id(existing_view, dv_id)
                         total_id_stamped += 1
@@ -529,12 +906,21 @@ with ui.ProgressBar(title=u"Import Sheets with Views", cancellable=True, step=5)
                                         p.Set(title_on_sheet)
                                 except Exception:
                                     pass
-                            view_results.append(("updated", view_name, existing_view.Name, ""))
+                            match_reason = (u"matched by Detail ID" if (dv_id and existing_by_id.get(dv_id) is not None)
+                                            else u"matched by name")
+                            _det = u"crop updated  •  {}".format(match_reason)
+                            view_results.append(("updated", view_name, existing_view.Name, _det))
+                            phase_a_result_by_view[dv_name] = (u"🔄", u"updated", _det)
                             total_v_updated += 1
                         except Exception as e:
                             view_results.append(("error", view_name, dv_name, str(e)))
+                            phase_a_result_by_view[dv_name] = (u"❌", u"error", str(e)[:80])
                     else:
-                        view_results.append(("skipped", view_name, existing_view.Name, ""))
+                        match_reason = (u"matched by Detail ID" if (dv_id and existing_by_id.get(dv_id) is not None)
+                                        else u"matched by name")
+                        _det = u"already exists, strategy = keep  •  {}".format(match_reason)
+                        view_results.append(("skipped", view_name, existing_view.Name, _det))
+                        phase_a_result_by_view[dv_name] = (u"⏭️", u"kept", _det)
                         total_v_skipped += 1
                     continue
 
@@ -579,16 +965,19 @@ with ui.ProgressBar(title=u"Import Sheets with Views", cancellable=True, step=5)
 
                     pending_crops.append((new_view, make_crop_loop(corners_world)))
 
-                    view_results.append(("created", view_name, final_name,
-                                        u"ID: {}  |  Title: {}".format(
-                                            dv_id or u"—",
-                                            title_on_sheet or u"(no title)")))
+                    _rename_note = u" (renamed to '{}')".format(final_name) if final_name != dv_name else u""
+                    _det = u"ID: {}  |  Title: {}{}".format(
+                        dv_id or u"—", title_on_sheet or u"(no title)", _rename_note)
+                    view_results.append(("created", view_name, final_name, _det))
+                    phase_a_result_by_view[dv_name] = (u"✅", u"created", _det)
                     total_v_created += 1
                     existing_proj_names.add(final_name)
-                    dep_view_by_name[final_name] = new_view   # make available for sheet phase
+                    dep_view_by_name[final_name] = new_view   # keyed by final (possibly renamed) name
+                    phase_a_lookup[dv_name]      = new_view   # keyed by original JSON name for Phase B
 
                 except Exception as e:
                     view_results.append(("error", view_name, dv_name, str(e)))
+                    phase_a_result_by_view[dv_name] = (u"❌", u"error", str(e)[:80])
 
             # Pass 2: apply crop shapes for this master
             for new_view, crop_loop in pending_crops:
@@ -632,6 +1021,8 @@ with ui.ProgressBar(title=u"Import Sheets with Views", cancellable=True, step=5)
 
     vp_created = 0
     vp_updated = 0
+    vp_moved   = 0
+    vp_cleaned = 0   # Phase B.0 — viewports removed from sheets (view stays alive)
     dl_created = 0
     dl_deleted = 0
     sheet_results = []   # (status, sheet_label, view_name, detail_str)
@@ -654,28 +1045,98 @@ with ui.ProgressBar(title=u"Import Sheets with Views", cancellable=True, step=5)
 
         if suffix not in sheet_by_suffix:
             sheet_results.append(("skipped", sheet_label, u"—",
-                                  u"Sheet not found in model"))
+                                  u"No sheet with number '{}' in this model — "
+                                  u"check prefix or create the sheet first".format(sheet_label)))
             continue
 
         target_sheet     = sheet_by_suffix[suffix]
         vp_id_to_det_num = {}
+        original_numbers = {}   # VP id → detail number at sheet-start (populated by T0)
 
-        # ══ T1: viewports + lines ══
+        # ══ B.0: clean orphan viewports ══════════════════════════════════════
+        # Per-sheet strict: any viewport on this sheet whose view is NOT in this
+        # sheet's JSON viewports gets removed. The View element itself is kept —
+        # only the placement on this sheet goes away, so it remains available
+        # for future imports onto other sheets.
+        _json_view_ids_this_sheet = set()
+        for _vp_entry in sheet_data["viewports"]:
+            _tv = phase_a_lookup.get(_vp_entry["view_name"]) or dep_view_by_name.get(_vp_entry["view_name"])
+            if _tv is not None:
+                _json_view_ids_this_sheet.add(_tv.Id.IntegerValue)
+
+        _orphan_vps = []
+        for _vp in DB.FilteredElementCollector(doc, target_sheet.Id).OfClass(DB.Viewport).ToElements():
+            if _vp.ViewId.IntegerValue not in _json_view_ids_this_sheet:
+                _orphan_vps.append(_vp)
+
+        if _orphan_vps:
+            _b0 = DB.Transaction(doc, "Import Sheets with Views B0 - {}".format(sheet_label))
+            try:
+                _b0.Start()
+                for _vp in _orphan_vps:
+                    _vid_int  = _vp.ViewId.IntegerValue
+                    try:
+                        _v_obj   = doc.GetElement(DB.ElementId(_vid_int))
+                        _v_name  = _v_obj.Name if _v_obj else u"?"
+                    except Exception:
+                        _v_name  = u"?"
+                    try:
+                        doc.Delete(_vp.Id)
+                        # Invalidate cache so Phase B's existing-VP lookup doesn't
+                        # return a deleted reference for this view
+                        if _vid_int in viewport_by_view_id and \
+                           viewport_by_view_id[_vid_int].Id == _vp.Id:
+                            del viewport_by_view_id[_vid_int]
+                        vp_cleaned += 1
+                        sheet_results.append(("cleaned", sheet_label, _v_name,
+                                              u"removed from sheet — not in JSON viewports"))
+                    except Exception as _ce:
+                        sheet_results.append(("error", sheet_label, _v_name,
+                                              u"B.0 cleanup failed: {}".format(_ce)))
+                _b0.Commit()
+            except Exception as _be:
+                try:
+                    if _b0.HasStarted() and not _b0.HasEnded():
+                        _b0.RollBack()
+                except Exception:
+                    pass
+                sheet_results.append(("error", sheet_label, u"B.0 rolled back", str(_be)))
+
+        # ══ T0: free up the detail-number namespace ══════════════════════════
+        # Move every existing VP on this sheet to a unique temp number in its
+        # own committed transaction.  This guarantees a clean slate before T1
+        # creates/places new VPs (Revit auto-assigns numbers to new VPs; those
+        # auto-numbers can collide with the targets we'll set in T2 — but only
+        # if the originals are still occupying those slots).
+        # Skipped when DO_DET_NUMBER is False (numbers are never touched).
+        if DO_DET_NUMBER:
+            t0 = DB.Transaction(doc,
+                                "Import Sheets with Views T0 - {}".format(sheet_label))
+            try:
+                t0.Start()
+                _vps_t0 = list(DB.FilteredElementCollector(doc, target_sheet.Id)
+                               .OfClass(DB.Viewport).ToElements())
+                original_numbers = {sv.Id.IntegerValue: get_detail_number(sv)
+                                    for sv in _vps_t0}
+                _ts0 = str(int(time.time()))
+                for _idx, sv in enumerate(_vps_t0):
+                    set_detail_number(sv, "zzz{}_{}".format(_ts0, _idx))
+                t0.Commit()
+            except Exception as e:
+                try:
+                    if t0.HasStarted() and not t0.HasEnded():
+                        t0.RollBack()
+                except Exception:
+                    pass
+                sheet_results.append(("error", sheet_label, u"T0 rolled back", str(e)))
+                continue
+
+        # ══ T1: viewports + lines ═══════════════════════════════════════════
+        # Creates, updates, or moves viewports.  Detail numbers are NOT touched
+        # here — T0 already cleared the namespace; T2 will assign finals.
         t1 = DB.Transaction(doc, "Import Sheets with Views T1 - {}".format(sheet_label))
         try:
             t1.Start()
-
-            all_sheet_vps_t1 = list(DB.FilteredElementCollector(doc, target_sheet.Id)
-                                    .OfClass(DB.Viewport).ToElements())
-            original_numbers = {sv.Id.IntegerValue: get_detail_number(sv)
-                                 for sv in all_sheet_vps_t1}
-
-            # Move all to temp numbers to free up values
-            timestamp = str(int(time.time()))
-            for idx, sv in enumerate(all_sheet_vps_t1):
-                set_detail_number(sv, "zzz{}_{}".format(timestamp, idx))
-
-            processed_vp_ids = []
 
             for entry in sheet_data["viewports"]:
                 view_name   = entry["view_name"]
@@ -683,12 +1144,17 @@ with ui.ProgressBar(title=u"Import Sheets with Views", cancellable=True, step=5)
                                      entry["viewport_center_y"], 0)
                 target_det  = entry.get("detail_number", "")
 
-                if view_name not in dep_view_by_name:
+                # Prefer phase_a_lookup (keyed by original JSON name) — handles
+                # cases where Phase A renamed the view or matched by detail_id
+                # to a differently-named existing dep. Fall back to dep_view_by_name
+                # for views that already existed and weren't in the JSON's master_views.
+                target_view = phase_a_lookup.get(view_name) or dep_view_by_name.get(view_name)
+                if target_view is None:
+                    master_hint = view_name_to_master.get(view_name, u"unknown master")
                     sheet_results.append(("skipped", sheet_label, view_name,
-                                          u"View not found in model"))
+                                          u"View not created — master '{}' not found in destination "
+                                          u"(Phase A skipped it)".format(master_hint)))
                     continue
-
-                target_view = dep_view_by_name[view_name]
 
                 try:
                     if target_view.Id.IntegerValue in viewport_by_view_id:
@@ -721,13 +1187,55 @@ with ui.ProgressBar(title=u"Import Sheets with Views", cancellable=True, step=5)
                                         pass
                             if DO_DET_NUMBER and target_det:
                                 vp_id_to_det_num[existing_vp.Id.IntegerValue] = target_det
-                            processed_vp_ids.append(existing_vp.Id.IntegerValue)
                             sheet_results.append(("updated", sheet_label, view_name,
                                                   u"det. {}".format(target_det) if target_det else u""))
                             vp_updated += 1
                         else:
-                            sheet_results.append(("skipped", sheet_label, view_name,
-                                                  u"Already on a different sheet"))
+                            # View is on a DIFFERENT sheet — move it here automatically.
+                            try:
+                                other_sheet = doc.GetElement(existing_vp.SheetId)
+                                other_num   = other_sheet.SheetNumber if other_sheet else u"unknown"
+                            except Exception:
+                                other_num = u"unknown"
+                            try:
+                                doc.Delete(existing_vp.Id)
+                                # Remove stale cache entry so it won't be found again
+                                viewport_by_view_id.pop(target_view.Id.IntegerValue, None)
+                                vp = DB.Viewport.Create(doc, target_sheet.Id, target_view.Id, center)
+                                if DO_POSITION:
+                                    vp.SetBoxCenter(center)
+                                    try:
+                                        vp.LabelOffset = DB.XYZ(
+                                            entry.get("label_offset_x", 0),
+                                            entry.get("label_offset_y", 0), 0)
+                                    except Exception:
+                                        pass
+                                if DO_VP_TYPE:
+                                    vt = entry.get("viewport_type", "")
+                                    if vt and vt in vp_type_by_name:
+                                        try:
+                                            vp.ChangeTypeId(vp_type_by_name[vt])
+                                        except Exception:
+                                            pass
+                                title = entry.get("title_on_sheet", "")
+                                if DO_TITLE and title:
+                                    try:
+                                        p = target_view.get_Parameter(
+                                            DB.BuiltInParameter.VIEW_DESCRIPTION)
+                                        if p and not p.IsReadOnly:
+                                            p.Set(title)
+                                    except Exception:
+                                        pass
+                                if DO_DET_NUMBER and target_det:
+                                    vp_id_to_det_num[vp.Id.IntegerValue] = target_det
+                                sheet_results.append(("moved", sheet_label, view_name,
+                                                      u"moved from sheet {}{}".format(
+                                                          other_num,
+                                                          u"  •  det. {}".format(target_det) if target_det else u"")))
+                                vp_moved += 1
+                            except Exception as e:
+                                sheet_results.append(("error", sheet_label, view_name,
+                                                      u"Failed to move from sheet {}: {}".format(other_num, str(e))))
                     else:
                         vp = DB.Viewport.Create(doc, target_sheet.Id, target_view.Id, center)
                         if DO_POSITION:
@@ -756,20 +1264,12 @@ with ui.ProgressBar(title=u"Import Sheets with Views", cancellable=True, step=5)
                                 pass
                         if DO_DET_NUMBER and target_det:
                             vp_id_to_det_num[vp.Id.IntegerValue] = target_det
-                        processed_vp_ids.append(vp.Id.IntegerValue)
                         sheet_results.append(("created", sheet_label, view_name,
                                               u"det. {}".format(target_det) if target_det else u""))
                         vp_created += 1
 
                 except Exception as e:
                     sheet_results.append(("error", sheet_label, view_name, str(e)))
-
-            # Restore non-processed viewports to their original detail numbers
-            for sv in all_sheet_vps_t1:
-                if sv.Id.IntegerValue not in processed_vp_ids:
-                    orig = original_numbers.get(sv.Id.IntegerValue, "")
-                    if orig:
-                        set_detail_number(sv, orig)
 
             # ── Detail lines ──
             if DO_LINES:
@@ -820,7 +1320,10 @@ with ui.ProgressBar(title=u"Import Sheets with Views", cancellable=True, step=5)
             sheet_results.append(("error", sheet_label, u"T1 rolled back", str(e)))
             continue
 
-        # ══ T2: assign final detail numbers ══
+        # ══ T2: assign final detail numbers ══════════════════════════════════
+        # T0 cleared the namespace; T1 placed VPs (Revit auto-assigned numbers).
+        # Now assign the targets from vp_id_to_det_num and restore original
+        # numbers to any pre-existing VP that wasn't given a new target.
         if not DO_DET_NUMBER or not vp_id_to_det_num:
             continue
 
@@ -833,9 +1336,16 @@ with ui.ProgressBar(title=u"Import Sheets with Views", cancellable=True, step=5)
             for idx, sv in enumerate(all_sheet_vps_t2):
                 set_detail_number(sv, "zzz{}_{}".format(ts2, idx))
             for sv in all_sheet_vps_t2:
-                det_num = vp_id_to_det_num.get(sv.Id.IntegerValue)
+                vid     = sv.Id.IntegerValue
+                det_num = vp_id_to_det_num.get(vid)
                 if det_num:
                     set_detail_number(sv, det_num)
+                elif vid in original_numbers:
+                    # Pre-existing VP not getting a new target — restore its
+                    # original number (same pattern as Apply Detail Numbers).
+                    orig = original_numbers[vid]
+                    if orig:
+                        set_detail_number(sv, orig)
             t2.Commit()
         except Exception as e:
             try:
@@ -845,65 +1355,207 @@ with ui.ProgressBar(title=u"Import Sheets with Views", cancellable=True, step=5)
                 pass
             sheet_results.append(("error", sheet_label, u"T2 rolled back", str(e)))
 
+# ── Reload CD link after import ──────────────────────────────────────────────
+_reload_succeeded = False
+if _link_was_unloaded and _cd_link_type is not None:
+    try:
+        _cd_link_type.Load(None)
+        _reload_succeeded = True
+    except Exception:
+        pass   # Non-critical — user can reload manually from Manage Links
+
 # ─────────────────────────────────────────────────────────────────────────────
-# 7. Noir results window
+# 7. Noir results window — grouped by sheet (collapsible), issues section on top
 # ─────────────────────────────────────────────────────────────────────────────
 
 import clr
 clr.AddReference('System.Windows.Forms')
 clr.AddReference('PresentationCore')
-from System.Windows import Visibility
+from System.Windows import Visibility, Thickness
+from System.Windows.Media import SolidColorBrush, Color
 from System.Windows.Forms import Clipboard as WinFormsClipboard
 from System.Collections.ObjectModel import ObservableCollection
 
-class _Row(object):
-    _VIEW_LABELS = {
-        "created":     u"✅  View Created",
-        "updated":     u"🔄  View Updated",
-        "skipped":     u"⏭️  View Skipped",
-        "skip_master": u"⏭️  Master Not Found",
-        "error":       u"❌  Error",
+
+# ── Data classes ──────────────────────────────────────────────────────────────
+
+class _VPRow(object):
+    """One viewport row inside a sheet expander."""
+    _PB_ICONS = {
+        "created": u"📄+", "updated": u"📄↺",
+        "moved":   u"🚚",  "cleaned": u"🗑",
+        "skipped": u"⏭️", "error": u"❌",
     }
-    _SHEET_LABELS = {
-        "created": u"✅  VP Created",
-        "updated": u"🔄  VP Updated",
-        "skipped": u"⏭️  Skipped",
-        "lines":   u"📐  Lines",
-        "error":   u"❌  Error",
-    }
-
-    def __init__(self, section, status, col1, col2, col3):
-        # section: "VIEW" or "SHEET"
-        self._section = section
-        self._status  = status
-        self._col1    = col1   # master (views) / sheet (sheets)
-        self._col2    = col2   # view name
-        self._col3    = col3   # detail
+    def __init__(self, view_name, pa_icon, pa_action, pb_status, pb_detail,
+                 is_moved=False, is_cleaned=False):
+        self._view_name  = view_name
+        self._pa_icon    = pa_icon          # Phase A icon (✅/🔄/⏭️/❌/—)
+        self._pa_action  = pa_action        # "created" / "kept" / "updated" / "error" / "—"
+        self._pb_status  = pb_status        # "created" / "updated" / "moved" / "cleaned" / "skipped" / "error"
+        self._pb_detail  = pb_detail
+        self._is_moved   = is_moved
+        self._is_cleaned = is_cleaned
 
     @property
-    def Section(self):  return self._section
+    def ViewName(self):  return self._view_name
     @property
-    def Status(self):
-        if self._section == "VIEW":
-            return self._VIEW_LABELS.get(self._status, self._status)
-        return self._SHEET_LABELS.get(self._status, self._status)
+    def PhaseA(self):    return u"{}  {}".format(self._pa_icon, self._pa_action)
     @property
-    def Col1(self):     return self._col1
+    def PhaseB(self):    return u"{}  {}".format(self._PB_ICONS.get(self._pb_status, u"·"), self._pb_detail)
     @property
-    def Col2(self):     return self._col2
+    def IsMoved(self):   return self._is_moved
     @property
-    def Col3(self):     return self._col3
+    def IsCleaned(self): return self._is_cleaned
 
+
+class _SheetGroup(object):
+    """One sheet expander in the import results."""
+    def __init__(self, sheet_label, sheet_name, rows, sheet_status="ok", sheet_detail="",
+                 is_open=False):
+        self._label       = sheet_label
+        self._name        = sheet_name
+        self._rows        = rows
+        self._status      = sheet_status   # "ok" | "not_found" | "error" | "partial"
+        self._detail      = sheet_detail
+        self._is_open     = is_open
+
+    @property
+    def SheetLabel(self):   return self._label
+    @property
+    def SheetName(self):    return self._name
+    @property
+    def StatusIcon(self):
+        return {
+            "ok":        u"✅", "partial": u"⚠️",
+            "not_found": u"❌", "error":   u"❌",
+        }.get(self._status, u"·")
+    @property
+    def Count(self):
+        n = len(self._rows)
+        return u"{} view{}".format(n, u"s" if n != 1 else u"")
+    @property
+    def Detail(self):       return self._detail
+    @property
+    def IsOpen(self):       return self._is_open
+    @property
+    def Rows(self):         return self._rows
+
+
+class _IssueRow(object):
+    """Issues not tied to a specific sheet (skip_master, view errors)."""
+    def __init__(self, icon, subject, detail):
+        self._icon    = icon
+        self._subject = subject
+        self._detail  = detail
+    @property
+    def Icon(self):    return self._icon
+    @property
+    def Subject(self): return self._subject
+    @property
+    def Detail(self):  return self._detail
+
+
+# ── Build grouped data ────────────────────────────────────────────────────────
+
+# Build sheet_results lookup: (sheet_label, view_name) → (status, detail)
+_pb_by_sheet_view = {}
+_sheet_lines      = {}   # sheet_label → "N created / M deleted"
+_cleaned_by_sheet = {}   # sheet_label → [(view_name, detail), ...]
+for _st, _sl, _vn, _det in sheet_results:
+    if _st == "lines":
+        _sheet_lines[_sl] = _vn + u"  /  " + _det
+    elif _st == "cleaned":
+        _cleaned_by_sheet.setdefault(_sl, []).append((_vn, _det))
+    else:
+        _pb_by_sheet_view[(_sl, _vn)] = (_st, _det)
+
+# Sheets not found (sheet_results entries with view_name == "—")
+_not_found_sheets = {_sl for _st, _sl, _vn, _det in sheet_results
+                     if _st == "skipped" and _vn == u"—"}
+
+# Build ObservableCollections for the UI
+sheet_groups_oc = ObservableCollection[_SheetGroup]()
+
+for sh in sheets_data:
+    suffix      = sh["sheet_number"][2:] if len(sh["sheet_number"]) > 2 else sh["sheet_number"]
+    sheet_label = u"{}{}".format(dest_prefix, suffix)
+    sheet_name  = sh.get("sheet_name", "")
+
+    if sheet_label in _not_found_sheets:
+        _det_for_sheet = next(
+            (_det for _st, _sl, _vn, _det in sheet_results
+             if _sl == sheet_label and _vn == u"—"), u"Sheet not found")
+        sheet_groups_oc.Add(_SheetGroup(
+            sheet_label, sheet_name,
+            ObservableCollection[_VPRow](),
+            sheet_status="not_found",
+            sheet_detail=_det_for_sheet))
+        continue
+
+    rows_oc      = ObservableCollection[_VPRow]()
+    sheet_ok     = True
+
+    for vp_entry in sh.get("viewports", []):
+        vn = vp_entry["view_name"]
+        pa_icon, pa_action, _pa_det = phase_a_result_by_view.get(vn, (u"—", u"—", u""))
+        pb_status, pb_detail        = _pb_by_sheet_view.get((sheet_label, vn), ("skipped", u"not processed"))
+        is_moved = (pb_status == "moved")
+
+        if pb_status in ("error", "skipped") or pa_action == "error":
+            sheet_ok = False
+
+        # Friendly Phase B label
+        _pb_labels = {
+            "created": u"VP placed",
+            "updated": u"VP updated",
+            "moved":   pb_detail,      # already has "moved from Xnn" text
+            "skipped": pb_detail,
+            "error":   pb_detail,
+        }
+        pb_display = _pb_labels.get(pb_status, pb_detail)
+
+        rows_oc.Add(_VPRow(vn, pa_icon, pa_action, pb_status, pb_display, is_moved))
+
+    # Append cleaned viewports (removed by Phase B.0) as extra rows so they show up
+    for _cleaned_name, _cleaned_det in _cleaned_by_sheet.get(sheet_label, []):
+        rows_oc.Add(_VPRow(_cleaned_name, u"—", u"—",
+                           "cleaned", _cleaned_det,
+                           is_moved=False, is_cleaned=True))
+
+    _lines_note = _sheet_lines.get(sheet_label, "")
+    sheet_groups_oc.Add(_SheetGroup(
+        sheet_label, sheet_name, rows_oc,
+        sheet_status="ok" if sheet_ok else "partial",
+        sheet_detail=_lines_note))
+
+# Issues: skip_master + view errors not tied to sheet + name fix errors
+issues_oc = ObservableCollection[_IssueRow]()
+for _st, _master, _vn, _det in view_results:
+    if _st == "skip_master":
+        issues_oc.Add(_IssueRow(u"❌", u"Master not found: {}".format(_master), _det))
+    elif _st == "error":
+        issues_oc.Add(_IssueRow(u"❌", u"View error: {}  /  {}".format(_master, _vn), _det))
+
+for _nfe_subject, _nfe_detail in name_fix_errors:
+    issues_oc.Add(_IssueRow(u"⚠", u"Name fix: {}".format(_nfe_subject), _nfe_detail))
+
+
+# ── Subtitle & counts ─────────────────────────────────────────────────────────
 
 n_v_errors = sum(1 for s, _, _, _ in view_results  if s == "error")
 n_s_errors = sum(1 for s, _, _, _ in sheet_results if s == "error")
 n_errors   = n_v_errors + n_s_errors
-n_skipped  = sum(1 for s, _, _, _ in sheet_results if s == "skipped")
 
-link_info = (chosen_link if chosen_link != NONE_OPTION else u"Local (no transform)")
-subtitle  = (u"{} views created  \xb7  {} updated  \xb7  {} skipped"
-             u"  \xb7  {} VPs on sheets").format(
-    total_v_created, total_v_updated, total_v_skipped, vp_created + vp_updated)
+subtitle = (u"{} views created  \xb7  {} updated  \xb7  {} skipped"
+            u"  \xb7  {} VPs  \xb7  {} moved").format(
+    total_v_created, total_v_updated, total_v_skipped,
+    vp_created + vp_updated, vp_moved)
+if vp_cleaned:
+    subtitle += u"  \xb7  {} cleaned".format(vp_cleaned)
+if n_type_fixed or n_scale_fixed:
+    subtitle += u"  \xb7  {} fixed".format(n_type_fixed + n_scale_fixed)
+if n_renamed:
+    subtitle += u"  \xb7  {} renamed".format(n_renamed)
 if n_errors:
     subtitle += u"  \xb7  {} error{}".format(n_errors, u"s" if n_errors != 1 else u"")
 if master_map_info:
@@ -911,29 +1563,101 @@ if master_map_info:
 if cancelled:
     subtitle += u"  \xb7  ⚠ partial"
 
+# ── Pre-flight view-name sets (used by badge filters) ────────────────────────
+_type_fixed_names  = {r._view_name for r in _pf_rows if r._issue == u"Type changed"}
+_scale_fixed_names = {r._view_name for r in _pf_rows if r._issue == u"Scale changed"}
+_renamed_names     = {r._view_name for r in _pf_rows if r._issue == u"Name mismatch"}
+
 _BODY_XAML = u"""
 <Grid>
+  <Grid.Resources>
+
+    <!-- Dark Expander — same template as Export results window -->
+    <Style TargetType="Expander">
+      <Setter Property="Template">
+        <Setter.Value>
+          <ControlTemplate TargetType="Expander">
+            <StackPanel>
+              <ToggleButton x:Name="hdr"
+                            IsChecked="{Binding IsExpanded, Mode=TwoWay,
+                                        RelativeSource={RelativeSource TemplatedParent}}"
+                            Content="{TemplateBinding Header}">
+                <ToggleButton.Template>
+                  <ControlTemplate TargetType="ToggleButton">
+                    <Border x:Name="hdrBorder" Background="#1A1B2E"
+                            BorderBrush="#2A2D47" BorderThickness="0,0,0,1"
+                            Padding="12,9" Cursor="Hand">
+                      <Grid>
+                        <Grid.ColumnDefinitions>
+                          <ColumnDefinition Width="16"/>
+                          <ColumnDefinition Width="*"/>
+                        </Grid.ColumnDefinitions>
+                        <TextBlock x:Name="arrow" Grid.Column="0"
+                                   Text="&#x25B6;" Foreground="#4A4F70"
+                                   FontSize="9" VerticalAlignment="Center"
+                                   HorizontalAlignment="Center"/>
+                        <ContentPresenter Grid.Column="1" VerticalAlignment="Center"/>
+                      </Grid>
+                    </Border>
+                    <ControlTemplate.Triggers>
+                      <Trigger Property="IsChecked" Value="True">
+                        <Setter TargetName="arrow"     Property="Text"       Value="&#x25BC;"/>
+                        <Setter TargetName="arrow"     Property="Foreground" Value="#9099C8"/>
+                        <Setter TargetName="hdrBorder" Property="Background" Value="#1E2235"/>
+                      </Trigger>
+                      <Trigger Property="IsMouseOver" Value="True">
+                        <Setter TargetName="hdrBorder" Property="Background" Value="#1E2235"/>
+                      </Trigger>
+                    </ControlTemplate.Triggers>
+                  </ControlTemplate>
+                </ToggleButton.Template>
+              </ToggleButton>
+              <ContentPresenter x:Name="body" Visibility="Collapsed"/>
+            </StackPanel>
+            <ControlTemplate.Triggers>
+              <Trigger Property="IsExpanded" Value="True">
+                <Setter TargetName="body" Property="Visibility" Value="Visible"/>
+              </Trigger>
+            </ControlTemplate.Triggers>
+          </ControlTemplate>
+        </Setter.Value>
+      </Setter>
+    </Style>
+
+  </Grid.Resources>
+
   <Grid.RowDefinitions>
+    <RowDefinition Height="Auto"/>
     <RowDefinition Height="Auto"/>
     <RowDefinition Height="*"/>
   </Grid.RowDefinitions>
 
-  <StackPanel Grid.Row="0" Orientation="Horizontal" Margin="0,0,0,16">
-    <Border Background="#122E1C" BorderBrush="#50E898" BorderThickness="1"
-            CornerRadius="4" Padding="10,4" Margin="0,0,8,0">
+  <!-- Badge row — filterable badges have Cursor="Hand"; click to filter the sheet list -->
+  <StackPanel Grid.Row="0" Orientation="Horizontal" Margin="0,0,0,12">
+    <Border x:Name="badgeVCreatedBorder" Background="#122E1C" BorderBrush="#50E898"
+            BorderThickness="1" CornerRadius="4" Padding="10,4" Margin="0,0,8,0"
+            Cursor="Hand">
       <TextBlock x:Name="badgeVCreated" Foreground="#50E898" FontFamily="Segoe UI" FontSize="13"/>
     </Border>
-    <Border Background="#142244" BorderBrush="#7EB4F0" BorderThickness="1"
-            CornerRadius="4" Padding="10,4" Margin="0,0,8,0">
+    <Border x:Name="badgeVUpdatedBorder" Background="#142244" BorderBrush="#7EB4F0"
+            BorderThickness="1" CornerRadius="4" Padding="10,4" Margin="0,0,8,0"
+            Cursor="Hand">
       <TextBlock x:Name="badgeVUpdated" Foreground="#7EB4F0" FontFamily="Segoe UI" FontSize="13"/>
     </Border>
-    <Border Background="#1E2740" BorderBrush="#6B7394" BorderThickness="1"
-            CornerRadius="4" Padding="10,4" Margin="0,0,8,0">
+    <Border x:Name="badgeVSkippedBorder" Background="#1E2740" BorderBrush="#6B7394"
+            BorderThickness="1" CornerRadius="4" Padding="10,4" Margin="0,0,8,0"
+            Cursor="Hand">
       <TextBlock x:Name="badgeVSkipped" Foreground="#6B7394" FontFamily="Segoe UI" FontSize="13"/>
     </Border>
-    <Border Background="#1A2535" BorderBrush="#5B8EC4" BorderThickness="1"
-            CornerRadius="4" Padding="10,4" Margin="0,0,8,0">
+    <Border x:Name="badgeSVPBorder" Background="#1A2535" BorderBrush="#5B8EC4"
+            BorderThickness="1" CornerRadius="4" Padding="10,4" Margin="0,0,8,0"
+            Cursor="Hand">
       <TextBlock x:Name="badgeSVP" Foreground="#5B8EC4" FontFamily="Segoe UI" FontSize="13"/>
+    </Border>
+    <Border x:Name="badgeMovedBorder" Background="#2A1800" BorderBrush="#E87E20"
+            BorderThickness="1" CornerRadius="4" Padding="10,4" Margin="0,0,8,0"
+            Cursor="Hand" Visibility="Collapsed">
+      <TextBlock x:Name="badgeMoved" Foreground="#E87E20" FontFamily="Segoe UI" FontSize="13"/>
     </Border>
     <Border x:Name="badgeLinesBorder" Background="#0F3038" BorderBrush="#5ED4E6"
             BorderThickness="1" CornerRadius="4" Padding="10,4" Margin="0,0,8,0"
@@ -950,63 +1674,165 @@ _BODY_XAML = u"""
             Visibility="Collapsed">
       <TextBlock x:Name="badgeCrop" Foreground="#B8A0E8" FontFamily="Segoe UI" FontSize="13"/>
     </Border>
+    <Border x:Name="badgeTypeFixedBorder" Background="#2E0F0F" BorderBrush="#FF6B6B"
+            BorderThickness="1" CornerRadius="4" Padding="10,4" Margin="0,0,8,0"
+            Cursor="Hand" Visibility="Collapsed">
+      <TextBlock x:Name="badgeTypeFixed" Foreground="#FF6B6B" FontFamily="Segoe UI" FontSize="13"/>
+    </Border>
+    <Border x:Name="badgeScaleFixedBorder" Background="#2E1F0A" BorderBrush="#F0A050"
+            BorderThickness="1" CornerRadius="4" Padding="10,4" Margin="0,0,8,0"
+            Cursor="Hand" Visibility="Collapsed">
+      <TextBlock x:Name="badgeScaleFixed" Foreground="#F0A050" FontFamily="Segoe UI" FontSize="13"/>
+    </Border>
+    <Border x:Name="badgeRenamedBorder" Background="#0F2A2E" BorderBrush="#5ED4D4"
+            BorderThickness="1" CornerRadius="4" Padding="10,4" Margin="0,0,8,0"
+            Cursor="Hand" Visibility="Collapsed">
+      <TextBlock x:Name="badgeRenamed" Foreground="#5ED4D4" FontFamily="Segoe UI" FontSize="13"/>
+    </Border>
+    <Border x:Name="badgeOldMarkedBorder" Background="#1F1F25" BorderBrush="#9099C8"
+            BorderThickness="1" CornerRadius="4" Padding="10,4" Margin="0,0,8,0"
+            Visibility="Collapsed">
+      <TextBlock x:Name="badgeOldMarked" Foreground="#9099C8" FontFamily="Segoe UI" FontSize="13"/>
+    </Border>
+    <Border x:Name="badgeVPCleanedBorder" Background="#0F1F2E" BorderBrush="#7AB8E0"
+            BorderThickness="1" CornerRadius="4" Padding="10,4" Margin="0,0,8,0"
+            Cursor="Hand" Visibility="Collapsed">
+      <TextBlock x:Name="badgeVPCleaned" Foreground="#7AB8E0" FontFamily="Segoe UI" FontSize="13"/>
+    </Border>
     <Border x:Name="badgeErrorBorder" Background="#3C1212" BorderBrush="#FF7070"
             BorderThickness="1" CornerRadius="4" Padding="10,4"
-            Visibility="Collapsed">
+            Cursor="Hand" Visibility="Collapsed">
       <TextBlock x:Name="badgeErrors" Foreground="#FF7070" FontFamily="Segoe UI" FontSize="13"/>
+    </Border>
+    <Border x:Name="badgeLinkBorder" BorderThickness="1" CornerRadius="4"
+            Padding="10,4" Margin="0,0,8,0" Visibility="Collapsed">
+      <TextBlock x:Name="badgeLink" FontFamily="Segoe UI" FontSize="13"/>
     </Border>
   </StackPanel>
 
-  <DataGrid Grid.Row="1" x:Name="dgResults"
-            AutoGenerateColumns="False" IsReadOnly="True"
-            HeadersVisibility="Column" GridLinesVisibility="Horizontal"
-            Background="#12131F" RowBackground="#12131F"
-            AlternatingRowBackground="#1A1B2E"
-            BorderBrush="#2A2D47" BorderThickness="1"
-            HorizontalGridLinesBrush="#2A2D47"
-            Foreground="#E8EBF5" FontFamily="Segoe UI" FontSize="12"
-            ColumnHeaderHeight="32" RowHeight="28"
-            SelectionMode="Extended" CanUserResizeRows="False"
-            CanUserReorderColumns="False" CanUserSortColumns="True">
-    <DataGrid.ColumnHeaderStyle>
-      <Style TargetType="DataGridColumnHeader">
-        <Setter Property="Background"      Value="#1E2235"/>
-        <Setter Property="Foreground"      Value="#9099C8"/>
-        <Setter Property="FontFamily"      Value="Segoe UI"/>
-        <Setter Property="FontSize"        Value="11"/>
-        <Setter Property="Padding"         Value="10,0"/>
-        <Setter Property="BorderBrush"     Value="#2A2D47"/>
-        <Setter Property="BorderThickness" Value="0,0,1,1"/>
-      </Style>
-    </DataGrid.ColumnHeaderStyle>
-    <DataGrid.CellStyle>
-      <Style TargetType="DataGridCell">
-        <Setter Property="BorderThickness" Value="0"/>
-        <Setter Property="Template">
-          <Setter.Value>
-            <ControlTemplate TargetType="DataGridCell">
-              <Border Background="{TemplateBinding Background}" Padding="10,0">
-                <ContentPresenter VerticalAlignment="Center"/>
-              </Border>
-            </ControlTemplate>
-          </Setter.Value>
-        </Setter>
-        <Style.Triggers>
-          <Trigger Property="IsSelected" Value="True">
-            <Setter Property="Background" Value="#2A3050"/>
-            <Setter Property="Foreground" Value="#E8EBF5"/>
-          </Trigger>
-        </Style.Triggers>
-      </Style>
-    </DataGrid.CellStyle>
-    <DataGrid.Columns>
-      <DataGridTextColumn Header=""           Binding="{Binding Section}" Width="60"/>
-      <DataGridTextColumn Header="Status"     Binding="{Binding Status}"  Width="160"/>
-      <DataGridTextColumn Header="Master / Sheet" Binding="{Binding Col1}" Width="180"/>
-      <DataGridTextColumn Header="View / VP"  Binding="{Binding Col2}"    Width="*"/>
-      <DataGridTextColumn Header="Detail"     Binding="{Binding Col3}"    Width="200"/>
-    </DataGrid.Columns>
-  </DataGrid>
+  <!-- Issues section (skip_master + view errors) — only shown when there are issues -->
+  <Border Grid.Row="1" x:Name="issuesBorder" Visibility="Collapsed" Margin="0,0,0,8">
+    <Expander IsExpanded="False">
+      <Expander.Header>
+        <StackPanel Orientation="Horizontal">
+          <Border Background="#3C1212" BorderBrush="#FF7070" BorderThickness="1"
+                  CornerRadius="4" Padding="8,3" Margin="0,0,10,0">
+            <TextBlock x:Name="issuesHeader" Foreground="#FF7070"
+                       FontFamily="Segoe UI" FontSize="12"/>
+          </Border>
+          <TextBlock Text="Click to expand details" Foreground="#6B7394"
+                     FontFamily="Segoe UI" FontSize="12" VerticalAlignment="Center"/>
+        </StackPanel>
+      </Expander.Header>
+      <ItemsControl x:Name="icIssues">
+        <ItemsControl.ItemTemplate>
+          <DataTemplate>
+            <Border Background="#1A0E0E" BorderBrush="#2A2D47" BorderThickness="0,0,0,1"
+                    Padding="44,0,16,0">
+              <Grid MinHeight="26">
+                <Grid.ColumnDefinitions>
+                  <ColumnDefinition Width="22"/>
+                  <ColumnDefinition Width="260"/>
+                  <ColumnDefinition Width="*"/>
+                </Grid.ColumnDefinitions>
+                <TextBlock Grid.Column="0" Text="{Binding Icon}"
+                           FontFamily="Segoe UI" FontSize="11" VerticalAlignment="Center"/>
+                <TextBlock Grid.Column="1" Text="{Binding Subject}"
+                           Foreground="#E8EBF5" FontFamily="Segoe UI" FontSize="12"
+                           VerticalAlignment="Center" Margin="0,0,8,0"
+                           TextTrimming="CharacterEllipsis"/>
+                <TextBlock Grid.Column="2" Text="{Binding Detail}"
+                           Foreground="#9099C8" FontFamily="Segoe UI" FontSize="11"
+                           VerticalAlignment="Center" TextWrapping="Wrap"/>
+              </Grid>
+            </Border>
+          </DataTemplate>
+        </ItemsControl.ItemTemplate>
+      </ItemsControl>
+    </Expander>
+  </Border>
+
+  <!-- Sheet list -->
+  <ScrollViewer Grid.Row="2" VerticalScrollBarVisibility="Auto">
+    <ItemsControl x:Name="icSheets">
+      <ItemsControl.ItemTemplate>
+        <DataTemplate>
+          <Expander Margin="0,0,0,2" IsExpanded="{Binding IsOpen}">
+
+            <!-- Sheet header -->
+            <Expander.Header>
+              <StackPanel Orientation="Horizontal">
+                <TextBlock Text="{Binding StatusIcon}" FontFamily="Segoe UI" FontSize="12"
+                           VerticalAlignment="Center" Margin="0,0,8,0"/>
+                <Border Background="#0F3038" BorderBrush="#5ED4E6" BorderThickness="1"
+                        CornerRadius="4" Padding="7,2" Margin="0,0,10,0">
+                  <TextBlock Text="{Binding SheetLabel}" Foreground="#5ED4E6"
+                             FontFamily="Consolas" FontSize="12"/>
+                </Border>
+                <TextBlock Text="{Binding SheetName}" Foreground="#E8EBF5"
+                           FontFamily="Segoe UI" FontSize="13"
+                           VerticalAlignment="Center" Margin="0,0,12,0"/>
+                <Border Background="#1A1D30" CornerRadius="4" Padding="7,2" Margin="0,0,8,0">
+                  <TextBlock Text="{Binding Count}" Foreground="#6B7394"
+                             FontFamily="Segoe UI" FontSize="11"/>
+                </Border>
+                <TextBlock Text="{Binding Detail}" Foreground="#6B7394"
+                           FontFamily="Segoe UI" FontSize="11"
+                           VerticalAlignment="Center"/>
+              </StackPanel>
+            </Expander.Header>
+
+            <!-- Viewport rows (Phase A + Phase B columns) -->
+            <ItemsControl ItemsSource="{Binding Rows}">
+              <ItemsControl.ItemTemplate>
+                <DataTemplate>
+                  <Border BorderBrush="#2A2D47" BorderThickness="0,0,0,1"
+                          Padding="44,0,16,0">
+                    <Border.Style>
+                      <Style TargetType="Border">
+                        <Setter Property="Background" Value="#12131F"/>
+                        <Style.Triggers>
+                          <DataTrigger Binding="{Binding IsMoved}" Value="True">
+                            <Setter Property="Background"      Value="#1C1200"/>
+                            <Setter Property="BorderBrush"     Value="#E87E20"/>
+                            <Setter Property="BorderThickness" Value="3,0,0,1"/>
+                          </DataTrigger>
+                          <DataTrigger Binding="{Binding IsCleaned}" Value="True">
+                            <Setter Property="Background"      Value="#0E1A24"/>
+                            <Setter Property="BorderBrush"     Value="#7AB8E0"/>
+                            <Setter Property="BorderThickness" Value="3,0,0,1"/>
+                          </DataTrigger>
+                        </Style.Triggers>
+                      </Style>
+                    </Border.Style>
+                    <Grid MinHeight="26">
+                      <Grid.ColumnDefinitions>
+                        <ColumnDefinition Width="*"/>
+                        <ColumnDefinition Width="160"/>
+                        <ColumnDefinition Width="200"/>
+                      </Grid.ColumnDefinitions>
+                      <TextBlock Grid.Column="0" Text="{Binding ViewName}"
+                                 Foreground="#E8EBF5" FontFamily="Segoe UI" FontSize="12"
+                                 VerticalAlignment="Center" Margin="0,0,8,0"
+                                 TextTrimming="CharacterEllipsis"/>
+                      <TextBlock Grid.Column="1" Text="{Binding PhaseA}"
+                                 Foreground="#9099C8" FontFamily="Segoe UI" FontSize="12"
+                                 VerticalAlignment="Center" Margin="0,0,8,0"/>
+                      <TextBlock Grid.Column="2" Text="{Binding PhaseB}"
+                                 Foreground="#E8EBF5" FontFamily="Segoe UI" FontSize="12"
+                                 VerticalAlignment="Center"
+                                 TextTrimming="CharacterEllipsis"/>
+                    </Grid>
+                  </Border>
+                </DataTemplate>
+              </ItemsControl.ItemTemplate>
+            </ItemsControl>
+
+          </Expander>
+        </DataTemplate>
+      </ItemsControl.ItemTemplate>
+    </ItemsControl>
+  </ScrollViewer>
 </Grid>
 """
 
@@ -1021,54 +1847,160 @@ _FOOTER_XAML = u"""
 </Grid>
 """
 
-rows = ObservableCollection[_Row]()
-for status, master, name, detail in view_results:
-    if status == "master":
-        continue
-    rows.Add(_Row("VIEW", status, master, name, detail))
-for status, sheet, name, detail in sheet_results:
-    rows.Add(_Row("SHEET", status, sheet, name, detail))
-
 win = ui.parse(u"Import Sheets with Views", subtitle, _BODY_XAML, _FOOTER_XAML,
-               width=1020, height=620)
+               width=1020, height=640)
 
 win.FindName("badgeVCreated").Text = u"✅  {} views created".format(total_v_created)
-win.FindName("badgeVUpdated").Text = u"🔄  {} views updated".format(total_v_updated)
-win.FindName("badgeVSkipped").Text = u"⏭️  {} views skipped".format(total_v_skipped)
-win.FindName("badgeSVP").Text      = u"\U0001f4c4  {} VPs on sheets".format(
-    vp_created + vp_updated)
+win.FindName("badgeVUpdated").Text = u"🔄  {} updated".format(total_v_updated)
+win.FindName("badgeVSkipped").Text = u"⏭️  {} kept".format(total_v_skipped)
+win.FindName("badgeSVP").Text      = u"\U0001f4c4  {} VPs".format(vp_created + vp_updated)
 
+if vp_moved:
+    win.FindName("badgeMovedBorder").Visibility = Visibility.Visible
+    win.FindName("badgeMoved").Text = u"🚚  {} moved".format(vp_moved)
 if dl_created:
     win.FindName("badgeLinesBorder").Visibility = Visibility.Visible
     win.FindName("badgeLines").Text = u"📐  {} lines".format(dl_created)
-
 if total_id_stamped:
     win.FindName("badgeIdBorder").Visibility = Visibility.Visible
     win.FindName("badgeIds").Text = u"🔖  {} IDs stamped".format(total_id_stamped)
-
 if total_crop_adjusted:
     win.FindName("badgeCropBorder").Visibility = Visibility.Visible
-    win.FindName("badgeCrop").Text = u"✂️  {} crops adjusted (1/8\" + hidden)".format(
-        total_crop_adjusted)
-
-
+    win.FindName("badgeCrop").Text = u"✂️  {} crops set".format(total_crop_adjusted)
+if n_type_fixed:
+    win.FindName("badgeTypeFixedBorder").Visibility = Visibility.Visible
+    win.FindName("badgeTypeFixed").Text = u"⛔  {} type-fixed".format(n_type_fixed)
+if n_scale_fixed:
+    win.FindName("badgeScaleFixedBorder").Visibility = Visibility.Visible
+    win.FindName("badgeScaleFixed").Text = u"⚠  {} scale-fixed".format(n_scale_fixed)
+if n_renamed:
+    win.FindName("badgeRenamedBorder").Visibility = Visibility.Visible
+    win.FindName("badgeRenamed").Text = u"✏  {} renamed".format(n_renamed)
+if n_old_marked:
+    win.FindName("badgeOldMarkedBorder").Visibility = Visibility.Visible
+    win.FindName("badgeOldMarked").Text = u"🏷  {} marked (old)".format(n_old_marked)
+if vp_cleaned:
+    win.FindName("badgeVPCleanedBorder").Visibility = Visibility.Visible
+    win.FindName("badgeVPCleaned").Text = u"🧹  {} VPs cleaned".format(vp_cleaned)
 if n_errors:
     win.FindName("badgeErrorBorder").Visibility = Visibility.Visible
     win.FindName("badgeErrors").Text = u"❌  {} error{}".format(
         n_errors, u"s" if n_errors != 1 else u"")
+if _link_was_unloaded:
+    _lb = win.FindName("badgeLinkBorder")
+    _lt = win.FindName("badgeLink")
+    _lb.Visibility = Visibility.Visible
+    if _reload_succeeded:
+        _lb.Background  = SolidColorBrush(Color.FromRgb(0x0F, 0x28, 0x1C))
+        _lb.BorderBrush = SolidColorBrush(Color.FromRgb(0x50, 0xC8, 0x78))
+        _lt.Foreground  = SolidColorBrush(Color.FromRgb(0x50, 0xC8, 0x78))
+        _lt.Text = u"🔗  CD link reloaded"
+    else:
+        _lb.Background  = SolidColorBrush(Color.FromRgb(0x2E, 0x1F, 0x0A))
+        _lb.BorderBrush = SolidColorBrush(Color.FromRgb(0xF0, 0xA0, 0x50))
+        _lt.Foreground  = SolidColorBrush(Color.FromRgb(0xF0, 0xA0, 0x50))
+        _lt.Text = u"⚠  CD link unloaded — reload from Manage Links"
 
-win.FindName("dgResults").ItemsSource = rows
+win.FindName("icSheets").ItemsSource = sheet_groups_oc
+
+# ── Badge filter logic ────────────────────────────────────────────────────────
+
+_all_groups    = sheet_groups_oc   # permanent reference for reset
+_active_filter = [None]            # mutable list so closures can write to it
+
+_FILTER_PREDICATES = {
+    "created":     lambda r: r._pa_action == "created",
+    "updated":     lambda r: r._pa_action == "updated",
+    "kept":        lambda r: r._pa_action == "kept",
+    "vp":          lambda r: r._pb_status in ("created", "updated"),
+    "moved":       lambda r: r._is_moved,
+    "cleaned":     lambda r: r._is_cleaned,
+    "error":       lambda r: r._pa_action == "error" or r._pb_status == "error",
+    "type_fixed":  lambda r: r._view_name in _type_fixed_names,
+    "scale_fixed": lambda r: r._view_name in _scale_fixed_names,
+    "renamed":     lambda r: r._view_name in _renamed_names,
+}
+
+_BADGE_BORDERS = [
+    ("badgeVCreatedBorder",   "created"),
+    ("badgeVUpdatedBorder",   "updated"),
+    ("badgeVSkippedBorder",   "kept"),
+    ("badgeSVPBorder",        "vp"),
+    ("badgeMovedBorder",      "moved"),
+    ("badgeVPCleanedBorder",  "cleaned"),
+    ("badgeErrorBorder",      "error"),
+    ("badgeTypeFixedBorder",  "type_fixed"),
+    ("badgeScaleFixedBorder", "scale_fixed"),
+    ("badgeRenamedBorder",    "renamed"),
+]
+
+def _apply_filter(filter_key):
+    ic = win.FindName("icSheets")
+    if _active_filter[0] == filter_key:
+        # Toggle off — show all
+        _active_filter[0] = None
+        ic.ItemsSource = _all_groups
+        for bname, _ in _BADGE_BORDERS:
+            b = win.FindName(bname)
+            if b is not None:
+                b.Opacity = 1.0
+                b.BorderThickness = Thickness(1)
+        return
+    # Apply filter
+    _active_filter[0] = filter_key
+    pred = _FILTER_PREDICATES[filter_key]
+    filtered = ObservableCollection[_SheetGroup]()
+    for sg in _all_groups:
+        matching = ObservableCollection[_VPRow]()
+        for row in sg.Rows:
+            if pred(row):
+                matching.Add(row)
+        if len(matching) > 0:
+            filtered.Add(_SheetGroup(sg.SheetLabel, sg.SheetName, matching,
+                                     sg._status, sg._detail, is_open=True))
+    ic.ItemsSource = filtered
+    # Visual feedback
+    for bname, key in _BADGE_BORDERS:
+        b = win.FindName(bname)
+        if b is None:
+            continue
+        if key == filter_key:
+            b.Opacity = 1.0
+            b.BorderThickness = Thickness(2)
+        else:
+            b.Opacity = 0.45
+            b.BorderThickness = Thickness(1)
+
+for _bname, _fkey in _BADGE_BORDERS:
+    _b = win.FindName(_bname)
+    if _b is not None:
+        _b.MouseLeftButtonUp += (lambda s, e, k=_fkey: _apply_filter(k))
+
+if len(issues_oc) > 0:
+    win.FindName("issuesBorder").Visibility = Visibility.Visible
+    win.FindName("issuesHeader").Text = u"⚠  {} issue{}".format(
+        len(issues_oc), u"s" if len(issues_oc) != 1 else u"")
+    win.FindName("icIssues").ItemsSource = issues_oc
+
 
 def on_copy(s, e):
     lines_out = [u"Import Sheets with Views — " + subtitle, u""]
-    for r in rows:
-        line = u"{}  {}  |  {}  |  {}".format(
-            r.Section, r.Status, r.Col1, r.Col2)
-        if r.Col3:
-            line += u"  |  " + r.Col3
-        lines_out.append(line)
+    if len(issues_oc) > 0:
+        lines_out.append(u"── ISSUES ──")
+        for iss in issues_oc:
+            lines_out.append(u"  {}  {}  |  {}".format(iss.Icon, iss.Subject, iss.Detail))
+        lines_out.append(u"")
+    for sg in sheet_groups_oc:
+        lines_out.append(u"{}  {}  {}  ({}){}".format(
+            sg.StatusIcon, sg.SheetLabel, sg.SheetName, sg.Count,
+            u"  " + sg.Detail if sg.Detail else u""))
+        for vr in sg.Rows:
+            lines_out.append(u"    {}  |  {}  |  {}".format(
+                vr.ViewName, vr.PhaseA, vr.PhaseB))
+        lines_out.append(u"")
     WinFormsClipboard.SetText(u"\n".join(lines_out))
     s.Content = u"Copied ✓"
+
 
 win.FindName("btnCopy").Click += on_copy
 win.FindName("btnOK").Click   += lambda s, e: win.Close()

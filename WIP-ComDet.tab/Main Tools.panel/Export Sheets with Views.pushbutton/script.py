@@ -42,16 +42,34 @@ def get_detail_id(view):
     p = view.LookupParameter("Detail ID")
     return (p.AsString() or "") if p else ""
 
+_vp_type_cache = {}
+
 def get_viewport_type_name(vp):
     try:
         type_id = vp.GetTypeId()
-        vp_type = doc.GetElement(type_id)
-        if vp_type is None:
-            return ""
-        p = vp_type.get_Parameter(DB.BuiltInParameter.ALL_MODEL_TYPE_NAME)
-        return (p.AsString() or "") if p else vp_type.Name
+        k = type_id.IntegerValue
+        if k not in _vp_type_cache:
+            vp_type = doc.GetElement(type_id)
+            if vp_type is None:
+                _vp_type_cache[k] = ""
+            else:
+                p = vp_type.get_Parameter(DB.BuiltInParameter.ALL_MODEL_TYPE_NAME)
+                _vp_type_cache[k] = (p.AsString() or "") if p else vp_type.Name
+        return _vp_type_cache[k]
     except Exception:
         return ""
+
+# ── Template-name cache ───────────────────────────────────────────────────────
+_template_cache = {}
+
+def get_template_name(tid):
+    if tid == DB.ElementId.InvalidElementId:
+        return ""
+    k = tid.IntegerValue
+    if k not in _template_cache:
+        tmpl = doc.GetElement(tid)
+        _template_cache[k] = tmpl.Name if tmpl else ""
+    return _template_cache[k]
 
 # ─────────────────────────────────────────────────────────────────────────────
 # 1. Select Common Details linked model (or 'None' if exporting from CD itself)
@@ -110,10 +128,9 @@ chosen_options = ui.pick_list(
     "2 of 3 — Select Sheets",
     button_name="Next",
     context=u"Pick which sheets to bundle into the JSON. Every dependent view "
-            u"placed on these sheets is captured (placed views are tagged for "
-            u"re-placement; any orphan dependents under the same masters are "
-            u"also captured, tagged unplaced). The result is one portable file "
-            u"that 'Import Sheets with Views' replays into any destination."
+            u"placed on these sheets is captured with its crop geometry and "
+            u"placement data. Views on sheets you didn't select are ignored — "
+            u"only what's on the selected sheets ends up in the file."
 )
 if not chosen_options:
     script.exit()
@@ -193,6 +210,7 @@ results   = []
 exported  = 0
 errors    = 0
 cancelled = False
+orphan_count = 0  # kept for backwards compat with result window (always 0 now)
 
 with ui.ProgressBar(title=u"Export Sheets with Views", cancellable=True, step=1) as pb:
     done = 0
@@ -240,12 +258,7 @@ with ui.ProgressBar(title=u"Export Sheets with Views", cancellable=True, step=1)
                 except Exception:
                     pass
 
-                template_name = ""
-                tid = dep.ViewTemplateId
-                if tid != DB.ElementId.InvalidElementId:
-                    tmpl = doc.GetElement(tid)
-                    if tmpl:
-                        template_name = tmpl.Name
+                template_name = get_template_name(dep.ViewTemplateId)
 
                 view_data["dependent_views"].append({
                     "view_name":      dep.Name,
@@ -271,93 +284,33 @@ with ui.ProgressBar(title=u"Export Sheets with Views", cancellable=True, step=1)
             break
 
 # ─────────────────────────────────────────────────────────────────────────────
-# 5a. Pass B — capture orphan dependents (created but not placed on
-#     selected sheets). Same masters as Pass A; we only add dep views that
-#     weren't already exported. This brings parity with the legacy
-#     "Export Views" tool which captured ALL dependents unfiltered.
-# ─────────────────────────────────────────────────────────────────────────────
-
-orphan_count = 0
-
-# Tag each Pass-A dep as placed (so consumers can tell apart)
-for mv_data in master_views_data:
-    for dv in mv_data["dependent_views"]:
-        dv.setdefault("placed_on_sheet", True)
-
-# Reverse index: master name → master view object (Pass A only kept names)
-master_view_by_name = {v.Name: v for v in master_view_by_id.values()}
-
-if not cancelled:
-    for mv_data in master_views_data:
-        mv_name = mv_data["view_name"]
-        master_obj = master_view_by_name.get(mv_name)
-        if master_obj is None:
-            # "Unknown Master" or master we couldn't resolve — can't enumerate deps
-            continue
-        already_exported = {dv["view_name"] for dv in mv_data["dependent_views"]}
-        for dep_id in master_obj.GetDependentViewIds():
-            dep = doc.GetElement(dep_id)
-            if dep is None or dep.Name in already_exported:
-                continue
-            try:
-                crop_box = dep.CropBox
-                if crop_box is None:
-                    results.append(("warning", mv_name, dep.Name,
-                                    u"Orphan skipped: no CropBox"))
-                    continue
-
-                min_pt    = crop_box.Min
-                max_pt    = crop_box.Max
-                transform = crop_box.Transform
-                local_corners = [
-                    DB.XYZ(min_pt.X, min_pt.Y, min_pt.Z),
-                    DB.XYZ(max_pt.X, min_pt.Y, min_pt.Z),
-                    DB.XYZ(max_pt.X, max_pt.Y, min_pt.Z),
-                    DB.XYZ(min_pt.X, max_pt.Y, min_pt.Z),
-                ]
-                world_corners = [transform.OfPoint(c) for c in local_corners]
-                rel_corners   = [xyz_to_list(world_to_link(c, link_transform))
-                                 for c in world_corners]
-
-                title_on_sheet = ""
-                try:
-                    p = dep.get_Parameter(DB.BuiltInParameter.VIEW_DESCRIPTION)
-                    if p:
-                        title_on_sheet = p.AsString() or ""
-                except Exception:
-                    pass
-
-                template_name = ""
-                tid = dep.ViewTemplateId
-                if tid != DB.ElementId.InvalidElementId:
-                    tmpl = doc.GetElement(tid)
-                    if tmpl:
-                        template_name = tmpl.Name
-
-                mv_data["dependent_views"].append({
-                    "view_name":       dep.Name,
-                    "detail_id":       get_detail_id(dep),
-                    "title_on_sheet":  title_on_sheet,
-                    "crop_corners":    rel_corners,
-                    "view_template":   template_name,
-                    "view_scale":      dep.Scale,
-                    "view_type":       str(dep.ViewType),
-                    "placed_on_sheet": False,
-                })
-                results.append(("orphan", mv_name, dep.Name,
-                                title_on_sheet or u"(no title)"))
-                orphan_count += 1
-            except Exception as e:
-                results.append(("error", mv_name, dep.Name, u"Orphan: " + str(e)))
-                errors += 1
-
-# ─────────────────────────────────────────────────────────────────────────────
 # 5b. Build sheets section (separate pass over selected_sheets)
 # ─────────────────────────────────────────────────────────────────────────────
 
-sheet_layout = []
+# ── Pre-bucket all sheet-level DetailLines (one global pass) ──────────────────
+# FilteredElementCollector(doc, sheet.Id) forces Revit to compute element
+# visibility for that view (loads view state, resolves VT, linked visibility).
+# One global pass + dict bucket eliminates the O(N) per-sheet overhead.
+_all_detail_lines = (DB.FilteredElementCollector(doc)
+                     .OfClass(DB.CurveElement)
+                     .ToElements())
+_sheet_detail_lines = {}
+for _dl in _all_detail_lines:
+    if not isinstance(_dl, DB.DetailLine):
+        continue
+    _sid = _dl.OwnerViewId.IntegerValue
+    if _sid not in _sheet_detail_lines:
+        _sheet_detail_lines[_sid] = []
+    _sheet_detail_lines[_sid].append(_dl)
 
-for sheet in selected_sheets:
+sheet_layout = []
+_n_sheets = len(selected_sheets)
+
+with ui.ProgressBar(title=u"Building sheet layout", cancellable=False, step=1) as pb2:
+  for _sheet_idx, sheet in enumerate(selected_sheets):
+    pb2.title = u"Sheet layout — {}/{} — {} {}".format(
+        _sheet_idx + 1, _n_sheets, sheet.SheetNumber, sheet.Name)
+    pb2.update_progress(_sheet_idx + 1, _n_sheets)
     sheet_entry = {
         "sheet_number": sheet.SheetNumber,
         "sheet_name":   sheet.Name,
@@ -392,12 +345,7 @@ for sheet in selected_sheets:
                 detail_number = p.AsString() or ""
         except Exception:
             pass
-        template_name = ""
-        tid = v.ViewTemplateId
-        if tid != DB.ElementId.InvalidElementId:
-            tmpl = doc.GetElement(tid)
-            if tmpl:
-                template_name = tmpl.Name
+        template_name = get_template_name(v.ViewTemplateId)
         sheet_entry["viewports"].append({
             "view_name":         v.Name,
             "viewport_center_x": center.X,
@@ -411,10 +359,8 @@ for sheet in selected_sheets:
             "detail_number":     detail_number,
             "view_type":         str(v.ViewType),
         })
-    for dl in DB.FilteredElementCollector(doc, sheet.Id).OfClass(DB.CurveElement).ToElements():
+    for dl in _sheet_detail_lines.get(sheet.Id.IntegerValue, []):
         try:
-            if not isinstance(dl, DB.DetailLine):
-                continue
             crv = dl.GeometryCurve
             p0  = crv.GetEndPoint(0)
             p1  = crv.GetEndPoint(1)
@@ -450,7 +396,7 @@ with open(save_path, "w") as f:
     json.dump(export_data, f, indent=2)
 
 # ─────────────────────────────────────────────────────────────────────────────
-# 7. Noir results window
+# 7. Noir results window — grouped by sheet (collapsible)
 # ─────────────────────────────────────────────────────────────────────────────
 
 import clr
@@ -460,26 +406,59 @@ from System.Windows import Visibility
 from System.Windows.Forms import Clipboard as WinFormsClipboard
 from System.Collections.ObjectModel import ObservableCollection
 
-class _Row(object):
-    _LABELS = {
-        "exported": u"✅  Exported",
-        "warning":  u"⚠️  Warning",
-        "error":    u"❌  Error",
-    }
+
+class _ViewRow(object):
+    _ICONS = {"exported": u"✅", "warning": u"⚠️", "error": u"❌"}
     def __init__(self, status, master, name, detail):
         self._status = status
         self._master = master
         self._name   = name
         self._detail = detail
+    @property
+    def StatusIcon(self): return self._ICONS.get(self._status, u"\xb7")
+    @property
+    def Master(self):     return self._master
+    @property
+    def ViewName(self):   return self._name
+    @property
+    def Detail(self):     return self._detail
 
+
+class _SheetGroup(object):
+    def __init__(self, number, name, views):
+        self._number = number
+        self._name   = name
+        self._views  = views
     @property
-    def Status(self):   return self._LABELS.get(self._status, self._status)
+    def SheetNumber(self): return self._number
     @property
-    def Master(self):   return self._master
+    def SheetName(self):   return self._name
     @property
-    def ViewName(self): return self._name
+    def Count(self):
+        n = len(self._views)
+        return u"{} view{}".format(n, u"s" if n != 1 else u"")
     @property
-    def Detail(self):   return self._detail
+    def Views(self):       return self._views
+
+
+# Build view → result lookup from Pass A
+view_result_by_name = {}
+for _st, _master, _name, _detail in results:
+    view_result_by_name[_name] = (_st, _master, _detail)
+
+# Build sheet groups (one per selected sheet, views in order they appear)
+sheet_groups = ObservableCollection[_SheetGroup]()
+for sh_entry in sheet_layout:
+    views_oc = ObservableCollection[_ViewRow]()
+    for vp_entry in sh_entry["viewports"]:
+        vname = vp_entry["view_name"]
+        if vname in view_result_by_name:
+            _st, _master, _detail = view_result_by_name[vname]
+        else:
+            _st, _master, _detail = "warning", u"", u"(not captured)"
+        views_oc.Add(_ViewRow(_st, _master, vname, _detail))
+    sheet_groups.Add(_SheetGroup(
+        sh_entry["sheet_number"], sh_entry["sheet_name"], views_oc))
 
 
 subtitle = u"{} views  \xb7  {} sheets  \xb7  {}".format(
@@ -489,12 +468,77 @@ if errors:
 if cancelled:
     subtitle += u"  \xb7  ⚠ partial"
 
+
 _BODY_XAML = u"""
 <Grid>
+  <Grid.Resources>
+
+    <!-- Dark Expander — full ControlTemplate so the header row is
+         completely re-skinned: arrow glyph + Noir background. -->
+    <Style TargetType="Expander">
+      <Setter Property="Template">
+        <Setter.Value>
+          <ControlTemplate TargetType="Expander">
+            <StackPanel>
+
+              <!-- Header toggle button -->
+              <ToggleButton x:Name="hdr"
+                            IsChecked="{Binding IsExpanded, Mode=TwoWay,
+                                        RelativeSource={RelativeSource TemplatedParent}}"
+                            Content="{TemplateBinding Header}">
+                <ToggleButton.Template>
+                  <ControlTemplate TargetType="ToggleButton">
+                    <Border x:Name="hdrBorder" Background="#1A1B2E"
+                            BorderBrush="#2A2D47" BorderThickness="0,0,0,1"
+                            Padding="12,9" Cursor="Hand">
+                      <Grid>
+                        <Grid.ColumnDefinitions>
+                          <ColumnDefinition Width="16"/>
+                          <ColumnDefinition Width="*"/>
+                        </Grid.ColumnDefinitions>
+                        <TextBlock x:Name="arrow" Grid.Column="0"
+                                   Text="&#x25B6;" Foreground="#4A4F70"
+                                   FontSize="9" VerticalAlignment="Center"
+                                   HorizontalAlignment="Center"/>
+                        <ContentPresenter Grid.Column="1" VerticalAlignment="Center"/>
+                      </Grid>
+                    </Border>
+                    <ControlTemplate.Triggers>
+                      <Trigger Property="IsChecked" Value="True">
+                        <Setter TargetName="arrow"     Property="Text"       Value="&#x25BC;"/>
+                        <Setter TargetName="arrow"     Property="Foreground" Value="#9099C8"/>
+                        <Setter TargetName="hdrBorder" Property="Background" Value="#1E2235"/>
+                      </Trigger>
+                      <Trigger Property="IsMouseOver" Value="True">
+                        <Setter TargetName="hdrBorder" Property="Background" Value="#1E2235"/>
+                      </Trigger>
+                    </ControlTemplate.Triggers>
+                  </ControlTemplate>
+                </ToggleButton.Template>
+              </ToggleButton>
+
+              <!-- Collapsible body -->
+              <ContentPresenter x:Name="body" Visibility="Collapsed"/>
+
+            </StackPanel>
+            <ControlTemplate.Triggers>
+              <Trigger Property="IsExpanded" Value="True">
+                <Setter TargetName="body" Property="Visibility" Value="Visible"/>
+              </Trigger>
+            </ControlTemplate.Triggers>
+          </ControlTemplate>
+        </Setter.Value>
+      </Setter>
+    </Style>
+
+  </Grid.Resources>
+
   <Grid.RowDefinitions>
     <RowDefinition Height="Auto"/>
     <RowDefinition Height="*"/>
   </Grid.RowDefinitions>
+
+  <!-- Badge row -->
   <StackPanel Grid.Row="0" Orientation="Horizontal" Margin="0,0,0,16">
     <Border Background="#122E1C" BorderBrush="#50E898" BorderThickness="1"
             CornerRadius="4" Padding="10,4" Margin="0,0,8,0">
@@ -508,66 +552,77 @@ _BODY_XAML = u"""
             CornerRadius="4" Padding="10,4" Margin="0,0,8,0">
       <TextBlock x:Name="badgeLink" Foreground="#7EB4F0" FontFamily="Segoe UI" FontSize="13"/>
     </Border>
-    <Border x:Name="badgeOrphanBorder" Background="#2A1E40" BorderBrush="#B8A0E8"
-            BorderThickness="1" CornerRadius="4" Padding="10,4" Margin="0,0,8,0"
-            Visibility="Collapsed">
-      <TextBlock x:Name="badgeOrphan" Foreground="#B8A0E8" FontFamily="Segoe UI" FontSize="13"/>
-    </Border>
     <Border x:Name="badgeErrorBorder" Background="#3C1212" BorderBrush="#FF7070"
             BorderThickness="1" CornerRadius="4" Padding="10,4"
             Visibility="Collapsed">
       <TextBlock x:Name="badgeErrors" Foreground="#FF7070" FontFamily="Segoe UI" FontSize="13"/>
     </Border>
   </StackPanel>
-  <DataGrid Grid.Row="1" x:Name="dgResults"
-            AutoGenerateColumns="False" IsReadOnly="True"
-            HeadersVisibility="Column" GridLinesVisibility="Horizontal"
-            Background="#12131F" RowBackground="#12131F"
-            AlternatingRowBackground="#1A1B2E"
-            BorderBrush="#2A2D47" BorderThickness="1"
-            HorizontalGridLinesBrush="#2A2D47"
-            Foreground="#E8EBF5" FontFamily="Segoe UI" FontSize="12"
-            ColumnHeaderHeight="32" RowHeight="28"
-            SelectionMode="Extended" CanUserResizeRows="False"
-            CanUserReorderColumns="False" CanUserSortColumns="True">
-    <DataGrid.ColumnHeaderStyle>
-      <Style TargetType="DataGridColumnHeader">
-        <Setter Property="Background"      Value="#1E2235"/>
-        <Setter Property="Foreground"      Value="#9099C8"/>
-        <Setter Property="FontFamily"      Value="Segoe UI"/>
-        <Setter Property="FontSize"        Value="11"/>
-        <Setter Property="Padding"         Value="10,0"/>
-        <Setter Property="BorderBrush"     Value="#2A2D47"/>
-        <Setter Property="BorderThickness" Value="0,0,1,1"/>
-      </Style>
-    </DataGrid.ColumnHeaderStyle>
-    <DataGrid.CellStyle>
-      <Style TargetType="DataGridCell">
-        <Setter Property="BorderThickness" Value="0"/>
-        <Setter Property="Template">
-          <Setter.Value>
-            <ControlTemplate TargetType="DataGridCell">
-              <Border Background="{TemplateBinding Background}" Padding="10,0">
-                <ContentPresenter VerticalAlignment="Center"/>
-              </Border>
-            </ControlTemplate>
-          </Setter.Value>
-        </Setter>
-        <Style.Triggers>
-          <Trigger Property="IsSelected" Value="True">
-            <Setter Property="Background" Value="#2A3050"/>
-            <Setter Property="Foreground" Value="#E8EBF5"/>
-          </Trigger>
-        </Style.Triggers>
-      </Style>
-    </DataGrid.CellStyle>
-    <DataGrid.Columns>
-      <DataGridTextColumn Header="Status"         Binding="{Binding Status}"   Width="140"/>
-      <DataGridTextColumn Header="Master View"    Binding="{Binding Master}"   Width="200"/>
-      <DataGridTextColumn Header="View Name"      Binding="{Binding ViewName}" Width="*"/>
-      <DataGridTextColumn Header="Title on Sheet" Binding="{Binding Detail}"   Width="200"/>
-    </DataGrid.Columns>
-  </DataGrid>
+
+  <!-- Sheet list -->
+  <ScrollViewer Grid.Row="1" VerticalScrollBarVisibility="Auto">
+    <ItemsControl x:Name="icSheets">
+      <ItemsControl.ItemTemplate>
+        <DataTemplate>
+          <Expander Margin="0,0,0,2">
+
+            <!-- Sheet header: [A1.01]  Sheet name  · N views -->
+            <Expander.Header>
+              <StackPanel Orientation="Horizontal">
+                <Border Background="#0F3038" BorderBrush="#5ED4E6" BorderThickness="1"
+                        CornerRadius="4" Padding="7,2" Margin="0,0,10,0">
+                  <TextBlock Text="{Binding SheetNumber}" Foreground="#5ED4E6"
+                             FontFamily="Consolas" FontSize="12"/>
+                </Border>
+                <TextBlock Text="{Binding SheetName}" Foreground="#E8EBF5"
+                           FontFamily="Segoe UI" FontSize="13"
+                           VerticalAlignment="Center" Margin="0,0,12,0"/>
+                <Border Background="#1A1D30" CornerRadius="4" Padding="7,2">
+                  <TextBlock Text="{Binding Count}" Foreground="#6B7394"
+                             FontFamily="Segoe UI" FontSize="11"/>
+                </Border>
+              </StackPanel>
+            </Expander.Header>
+
+            <!-- View rows (indented, compact) -->
+            <ItemsControl ItemsSource="{Binding Views}">
+              <ItemsControl.ItemTemplate>
+                <DataTemplate>
+                  <Border Background="#12131F" BorderBrush="#2A2D47"
+                          BorderThickness="0,0,0,1" Padding="44,0,16,0">
+                    <Grid MinHeight="26">
+                      <Grid.ColumnDefinitions>
+                        <ColumnDefinition Width="22"/>
+                        <ColumnDefinition Width="180"/>
+                        <ColumnDefinition Width="*"/>
+                        <ColumnDefinition Width="170"/>
+                      </Grid.ColumnDefinitions>
+                      <TextBlock Grid.Column="0" Text="{Binding StatusIcon}"
+                                 FontFamily="Segoe UI" FontSize="11"
+                                 VerticalAlignment="Center"/>
+                      <TextBlock Grid.Column="1" Text="{Binding Master}"
+                                 Foreground="#9099C8" FontFamily="Segoe UI" FontSize="12"
+                                 VerticalAlignment="Center" Margin="0,0,8,0"
+                                 TextTrimming="CharacterEllipsis"/>
+                      <TextBlock Grid.Column="2" Text="{Binding ViewName}"
+                                 Foreground="#E8EBF5" FontFamily="Segoe UI" FontSize="12"
+                                 VerticalAlignment="Center" Margin="0,0,8,0"
+                                 TextTrimming="CharacterEllipsis"/>
+                      <TextBlock Grid.Column="3" Text="{Binding Detail}"
+                                 Foreground="#6B7394" FontFamily="Segoe UI" FontSize="12"
+                                 VerticalAlignment="Center"
+                                 TextTrimming="CharacterEllipsis"/>
+                    </Grid>
+                  </Border>
+                </DataTemplate>
+              </ItemsControl.ItemTemplate>
+            </ItemsControl>
+
+          </Expander>
+        </DataTemplate>
+      </ItemsControl.ItemTemplate>
+    </ItemsControl>
+  </ScrollViewer>
 </Grid>
 """
 
@@ -582,18 +637,10 @@ _FOOTER_XAML = u"""
 </Grid>
 """
 
-rows = ObservableCollection[_Row]()
-for status, master, name, detail in results:
-    rows.Add(_Row(status, master, name, detail))
+win = ui.parse(u"Export Sheets with Views", subtitle, _BODY_XAML, _FOOTER_XAML, width=900, height=560)
 
-win = ui.parse(u"Export Sheets with Views", subtitle, _BODY_XAML, _FOOTER_XAML, width=960, height=560)
-
-win.FindName("badgeViews").Text   = u"✅  {} views exported".format(exported)
-if orphan_count:
-    win.FindName("badgeOrphanBorder").Visibility = Visibility.Visible
-    win.FindName("badgeOrphan").Text = u"🌒  {} orphan view{} (not placed)".format(
-        orphan_count, u"s" if orphan_count != 1 else u"")
-win.FindName("badgeSheets").Text  = u"\U0001f4c4  {} sheets".format(len(sheet_layout))
+win.FindName("badgeViews").Text  = u"✅  {} views exported".format(exported)
+win.FindName("badgeSheets").Text = u"\U0001f4c4  {} sheets".format(len(sheet_layout))
 if link_transform is None:
     win.FindName("badgeLink").Text = u"\U0001f3e0  Exported from Common Details (no link)"
 else:
@@ -604,15 +651,20 @@ if errors:
     win.FindName("badgeErrors").Text = u"❌  {} error{}".format(
         errors, u"s" if errors != 1 else u"")
 
-win.FindName("dgResults").ItemsSource = rows
+win.FindName("icSheets").ItemsSource = sheet_groups
+
 
 def on_copy(s, e):
     lines = [u"Export Sheets with Views — " + subtitle, u""]
-    for r in rows:
-        lines.append(u"{}  |  {}  |  {}  |  {}".format(
-            r.Status, r.Master, r.ViewName, r.Detail))
+    for sg in sheet_groups:
+        lines.append(u"{}  {}  ({})".format(sg.SheetNumber, sg.SheetName, sg.Count))
+        for vr in sg.Views:
+            lines.append(u"    {}  {}  |  {}  |  {}".format(
+                vr.StatusIcon, vr.Master, vr.ViewName, vr.Detail))
+        lines.append(u"")
     WinFormsClipboard.SetText(u"\n".join(lines))
     s.Content = u"Copied ✓"
+
 
 win.FindName("btnCopy").Click += on_copy
 win.FindName("btnOK").Click   += lambda s, e: win.Close()
