@@ -838,15 +838,25 @@ id_map  = {}
 stamped = 0
 new_views = summary.get("new_views", [])
 
-if new_views:
+# Only prompt for Detail ID assignment when running inside the Common Details
+# file. In building models, IDs would clash with CD's IDs on next sync — so we
+# silently skip the prompt (the user said: "preguntar nada más si estoy en
+# common details file"). Detection normalizes the doc title — strips any
+# non-alphanumeric chars and lowercases — so it matches "Common Details",
+# "COMMON-DETAILS", "common_details", and the substring embedded inside a
+# longer file name like "H05_064-COMMON-DETAILS-R23.rvt".
+_title_norm = u"".join(ch for ch in (doc.Title or u"").lower() if ch.isalnum())
+_is_common_details = u"commondetails" in _title_norm
+
+if new_views and _is_common_details:
     do_stamp = ui.confirm(
         u"Do you want to assign Detail IDs to the {} new view{}?".format(
             len(new_views), u"s" if len(new_views) != 1 else u""),
         title=u"Assign Detail IDs",
         context=(
             u"Detail IDs are used to match views across models during Export and Import. "
-            u"Only assign them if you're working in Common Details — assigning IDs in a "
-            u"building model may cause duplicates when syncing with Common Details."
+            u"You're in the Common Details file — this is the right place to stamp IDs "
+            u"so they propagate to every building on the next sync."
         )
     )
     if do_stamp:
@@ -870,17 +880,6 @@ if new_views:
                     next_id += 1
                     stamped += 1
             _t.Commit()
-    else:
-        ui.alert(
-            u"Detail IDs were not assigned.\n\n"
-            u"If you created these views outside Common Details, make sure to transfer "
-            u"them to the Common Details file before running Export or Import.\n\n"
-            u"The best approach for this workflow is to always author content in Common "
-            u"Details. If you are working on custom details, organize them on your sheets "
-            u"first — then transfer everything to Common Details so it becomes the single "
-            u"source of truth for all buildings.",
-            title=u"Workflow Reminder"
-        )
 
 summary["stamped"] = stamped
 show_results(summary, id_map)

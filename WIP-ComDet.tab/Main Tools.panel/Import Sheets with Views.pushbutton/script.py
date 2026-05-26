@@ -12,7 +12,8 @@ import os as _os
 import time
 from pyrevit import revit, DB, script, forms, HOST_APP
 from Autodesk.Revit.DB import (CurveLoop, Line, ViewDuplicateOption,
-                                BuiltInParameterGroup, BuiltInCategory)
+                                BuiltInParameterGroup, BuiltInCategory,
+                                ElementTransformUtils)
 
 _script_dir = _os.path.dirname(_os.path.abspath(__file__))
 _ext_dir = _script_dir
@@ -382,7 +383,7 @@ all_views_dest = DB.FilteredElementCollector(doc).OfClass(DB.View).ToElements()
 view_by_name      = {}
 template_by_name  = {}
 dep_view_by_name  = {}
-view_by_detail_id = {}   # global Detail ID → dependent view (for pre-flight precedence)
+view_by_detail_id = {}   # global Detail ID → LIST of dependent views (handles duplicates)
 
 for v in all_views_dest:
     try:
@@ -395,7 +396,7 @@ for v in all_views_dest:
                 dep_view_by_name[v.Name] = v
                 _did = get_detail_id(v)
                 if _did:
-                    view_by_detail_id[_did] = v
+                    view_by_detail_id.setdefault(_did, []).append(v)
     except Exception:
         pass
 
@@ -525,18 +526,29 @@ for _mv in data["master_views"]:
         _dv_id      = _dv.get("detail_id", "")
         _json_scale = _dv.get("view_scale", _mview.Scale)
 
-        # ── Precedence: exact (ID+name) > ID-only > name-only ────────────────
+        # ── Precedence: exact (ID+name) > ID-only (only if unambiguous) > name-only ──
+        # When multiple views share a Detail ID (e.g. user duplicated a view), prefer
+        # the one whose name matches the JSON. If no exact match exists, ID-only is
+        # only honored when there's a single candidate — otherwise it's ambiguous and
+        # we skip ID matching for this entry to avoid spurious rename suggestions.
         _ex = None
         _has_name_mismatch = False
 
         if _dv_id:
-            _by_id = view_by_detail_id.get(_dv_id)
-            if _by_id is not None:
-                if _by_id.Name == _dv_name:
-                    _ex = _by_id                  # exact match — canonical
-                else:
-                    _ex = _by_id                  # ID match, name differs
-                    _has_name_mismatch = True
+            _candidates = view_by_detail_id.get(_dv_id, [])
+            # Look for exact name match among ID candidates first
+            _exact = None
+            for _c in _candidates:
+                if _c.Name == _dv_name:
+                    _exact = _c
+                    break
+            if _exact is not None:
+                _ex = _exact                       # exact match — canonical
+            elif len(_candidates) == 1:
+                _ex = _candidates[0]               # ID match, name differs (unambiguous)
+                _has_name_mismatch = True
+            # else: multiple ID candidates and none match the name → ambiguous,
+            # fall through to name-only matching
 
         if _ex is None:
             _ex = dep_view_by_name.get(_dv_name)  # name-only match
@@ -766,7 +778,7 @@ if len(_pf_rows) > 0:
                         dep_view_by_name[_v.Name] = _v
                         _did = get_detail_id(_v)
                         if _did:
-                            view_by_detail_id[_did] = _v
+                            view_by_detail_id.setdefault(_did, []).append(_v)
             except Exception:
                 pass
         existing_proj_names = set(view_by_name.keys())
@@ -845,7 +857,7 @@ with ui.ProgressBar(title=u"Import Sheets with Views", cancellable=True, step=5)
             master_view = view_by_name[view_name]
             view_results.append(("master", view_name, "", ""))
 
-            existing_by_id   = {}
+            existing_by_id   = {}   # Detail ID → LIST of dep views (handles duplicates)
             existing_by_name = {}
             for vid in master_view.GetDependentViewIds():
                 dep = doc.GetElement(vid)
@@ -853,7 +865,7 @@ with ui.ProgressBar(title=u"Import Sheets with Views", cancellable=True, step=5)
                     existing_by_name[dep.Name] = dep
                     did = get_detail_id(dep)
                     if did:
-                        existing_by_id[did] = dep
+                        existing_by_id.setdefault(did, []).append(dep)
 
             pending_crops = []
 
@@ -873,7 +885,21 @@ with ui.ProgressBar(title=u"Import Sheets with Views", cancellable=True, step=5)
                     for c in dv_data["crop_corners"]
                 ]
 
-                existing_view = existing_by_id.get(dv_id) if dv_id else None
+                # Precedence: exact (ID+name) > ID-only (only if unambiguous) > name-only.
+                # Multiple dependents can share a Detail ID after duplication; prefer
+                # the one whose name matches. Ambiguous IDs fall through to name-only.
+                existing_view = None
+                _matched_by_id = False
+                if dv_id:
+                    _id_cands = existing_by_id.get(dv_id, [])
+                    for _c in _id_cands:
+                        if _c.Name == dv_name:
+                            existing_view = _c
+                            _matched_by_id = True
+                            break
+                    if existing_view is None and len(_id_cands) == 1:
+                        existing_view = _id_cands[0]
+                        _matched_by_id = True
                 if existing_view is None:
                     existing_view = existing_by_name.get(dv_name)
 
@@ -906,7 +932,7 @@ with ui.ProgressBar(title=u"Import Sheets with Views", cancellable=True, step=5)
                                         p.Set(title_on_sheet)
                                 except Exception:
                                     pass
-                            match_reason = (u"matched by Detail ID" if (dv_id and existing_by_id.get(dv_id) is not None)
+                            match_reason = (u"matched by Detail ID" if _matched_by_id
                                             else u"matched by name")
                             _det = u"crop updated  •  {}".format(match_reason)
                             view_results.append(("updated", view_name, existing_view.Name, _det))
@@ -916,7 +942,7 @@ with ui.ProgressBar(title=u"Import Sheets with Views", cancellable=True, step=5)
                             view_results.append(("error", view_name, dv_name, str(e)))
                             phase_a_result_by_view[dv_name] = (u"❌", u"error", str(e)[:80])
                     else:
-                        match_reason = (u"matched by Detail ID" if (dv_id and existing_by_id.get(dv_id) is not None)
+                        match_reason = (u"matched by Detail ID" if _matched_by_id
                                         else u"matched by name")
                         _det = u"already exists, strategy = keep  •  {}".format(match_reason)
                         view_results.append(("skipped", view_name, existing_view.Name, _det))
@@ -1052,6 +1078,8 @@ with ui.ProgressBar(title=u"Import Sheets with Views", cancellable=True, step=5)
         target_sheet     = sheet_by_suffix[suffix]
         vp_id_to_det_num = {}
         original_numbers = {}   # VP id → detail number at sheet-start (populated by T0)
+        vp_id_to_target_center = {}   # VP id → DB.XYZ target box center (for T3 alignment)
+        vp_id_to_source_box = {}      # VP id → (view_name, src_min_x, src_min_y, src_max_x, src_max_y) for diagnostic
 
         # ══ B.0: clean orphan viewports ══════════════════════════════════════
         # Per-sheet strict: any viewport on this sheet whose view is NOT in this
@@ -1075,24 +1103,32 @@ with ui.ProgressBar(title=u"Import Sheets with Views", cancellable=True, step=5)
                 _b0.Start()
                 for _vp in _orphan_vps:
                     _vid_int  = _vp.ViewId.IntegerValue
+                    _vp_id_int = _vp.Id.IntegerValue  # snapshot BEFORE delete
                     try:
                         _v_obj   = doc.GetElement(DB.ElementId(_vid_int))
                         _v_name  = _v_obj.Name if _v_obj else u"?"
                     except Exception:
                         _v_name  = u"?"
+                    # Delete first; only the delete itself can fail the cleanup.
                     try:
                         doc.Delete(_vp.Id)
-                        # Invalidate cache so Phase B's existing-VP lookup doesn't
-                        # return a deleted reference for this view
-                        if _vid_int in viewport_by_view_id and \
-                           viewport_by_view_id[_vid_int].Id == _vp.Id:
-                            del viewport_by_view_id[_vid_int]
-                        vp_cleaned += 1
-                        sheet_results.append(("cleaned", sheet_label, _v_name,
-                                              u"removed from sheet — not in JSON viewports"))
                     except Exception as _ce:
                         sheet_results.append(("error", sheet_label, _v_name,
                                               u"B.0 cleanup failed: {}".format(_ce)))
+                        continue
+                    # Delete succeeded → count as cleaned. Cache invalidation
+                    # below must NOT touch the deleted Viewport element (.Id on
+                    # a deleted element throws InvalidObjectException in some
+                    # Revit versions). Compare integer values instead.
+                    try:
+                        _cached = viewport_by_view_id.get(_vid_int)
+                        if _cached is not None and _cached.Id.IntegerValue == _vp_id_int:
+                            del viewport_by_view_id[_vid_int]
+                    except Exception:
+                        viewport_by_view_id.pop(_vid_int, None)
+                    vp_cleaned += 1
+                    sheet_results.append(("cleaned", sheet_label, _v_name,
+                                          u"✓ removed from sheet — view kept, available for future placement"))
                 _b0.Commit()
             except Exception as _be:
                 try:
@@ -1160,14 +1196,10 @@ with ui.ProgressBar(title=u"Import Sheets with Views", cancellable=True, step=5)
                     if target_view.Id.IntegerValue in viewport_by_view_id:
                         existing_vp = viewport_by_view_id[target_view.Id.IntegerValue]
                         if existing_vp.SheetId.IntegerValue == target_sheet.Id.IntegerValue:
-                            if DO_POSITION:
-                                existing_vp.SetBoxCenter(center)
-                                try:
-                                    existing_vp.LabelOffset = DB.XYZ(
-                                        entry.get("label_offset_x", 0),
-                                        entry.get("label_offset_y", 0), 0)
-                                except Exception:
-                                    pass
+                            # IMPORTANT order: ChangeTypeId → LabelOffset → title → SetBoxCenter LAST.
+                            # SetBoxCenter must be the FINAL operation because LabelOffset (and to a
+                            # lesser extent the type/title) can shift the box outline. Calling
+                            # SetBoxCenter last guarantees the requested center is the final state.
                             if DO_VP_TYPE:
                                 vt = entry.get("viewport_type", "")
                                 if vt and vt in vp_type_by_name:
@@ -1175,6 +1207,13 @@ with ui.ProgressBar(title=u"Import Sheets with Views", cancellable=True, step=5)
                                         existing_vp.ChangeTypeId(vp_type_by_name[vt])
                                     except Exception:
                                         pass
+                            if DO_POSITION:
+                                try:
+                                    existing_vp.LabelOffset = DB.XYZ(
+                                        entry.get("label_offset_x", 0),
+                                        entry.get("label_offset_y", 0), 0)
+                                except Exception:
+                                    pass
                             if DO_TITLE:
                                 title = entry.get("title_on_sheet", "")
                                 if title:
@@ -1185,6 +1224,17 @@ with ui.ProgressBar(title=u"Import Sheets with Views", cancellable=True, step=5)
                                             p.Set(title)
                                     except Exception:
                                         pass
+                            if DO_POSITION:
+                                existing_vp.SetBoxCenter(center)
+                                vp_id_to_target_center[existing_vp.Id.IntegerValue] = center
+                                vp_id_to_source_box[existing_vp.Id.IntegerValue] = (
+                                    view_name,
+                                    entry.get("box_min_x"), entry.get("box_min_y"),
+                                    entry.get("box_max_x"), entry.get("box_max_y"),
+                                    entry.get("label_min_x"), entry.get("label_min_y"),
+                                    entry.get("label_max_x"), entry.get("label_max_y"),
+                                    entry.get("title_on_sheet", u""),
+                                    entry.get("detail_number", u""))
                             if DO_DET_NUMBER and target_det:
                                 vp_id_to_det_num[existing_vp.Id.IntegerValue] = target_det
                             sheet_results.append(("updated", sheet_label, view_name,
@@ -1202,14 +1252,7 @@ with ui.ProgressBar(title=u"Import Sheets with Views", cancellable=True, step=5)
                                 # Remove stale cache entry so it won't be found again
                                 viewport_by_view_id.pop(target_view.Id.IntegerValue, None)
                                 vp = DB.Viewport.Create(doc, target_sheet.Id, target_view.Id, center)
-                                if DO_POSITION:
-                                    vp.SetBoxCenter(center)
-                                    try:
-                                        vp.LabelOffset = DB.XYZ(
-                                            entry.get("label_offset_x", 0),
-                                            entry.get("label_offset_y", 0), 0)
-                                    except Exception:
-                                        pass
+                                # Order: ChangeTypeId → LabelOffset → title → SetBoxCenter LAST.
                                 if DO_VP_TYPE:
                                     vt = entry.get("viewport_type", "")
                                     if vt and vt in vp_type_by_name:
@@ -1217,6 +1260,13 @@ with ui.ProgressBar(title=u"Import Sheets with Views", cancellable=True, step=5)
                                             vp.ChangeTypeId(vp_type_by_name[vt])
                                         except Exception:
                                             pass
+                                if DO_POSITION:
+                                    try:
+                                        vp.LabelOffset = DB.XYZ(
+                                            entry.get("label_offset_x", 0),
+                                            entry.get("label_offset_y", 0), 0)
+                                    except Exception:
+                                        pass
                                 title = entry.get("title_on_sheet", "")
                                 if DO_TITLE and title:
                                     try:
@@ -1226,10 +1276,21 @@ with ui.ProgressBar(title=u"Import Sheets with Views", cancellable=True, step=5)
                                             p.Set(title)
                                     except Exception:
                                         pass
+                                if DO_POSITION:
+                                    vp.SetBoxCenter(center)
+                                    vp_id_to_target_center[vp.Id.IntegerValue] = center
+                                    vp_id_to_source_box[vp.Id.IntegerValue] = (
+                                        view_name,
+                                        entry.get("box_min_x"), entry.get("box_min_y"),
+                                        entry.get("box_max_x"), entry.get("box_max_y"),
+                                        entry.get("label_min_x"), entry.get("label_min_y"),
+                                        entry.get("label_max_x"), entry.get("label_max_y"),
+                                        entry.get("title_on_sheet", u""),
+                                        entry.get("detail_number", u""))
                                 if DO_DET_NUMBER and target_det:
                                     vp_id_to_det_num[vp.Id.IntegerValue] = target_det
                                 sheet_results.append(("moved", sheet_label, view_name,
-                                                      u"moved from sheet {}{}".format(
+                                                      u"🚚 relocated from sheet {}{}".format(
                                                           other_num,
                                                           u"  •  det. {}".format(target_det) if target_det else u"")))
                                 vp_moved += 1
@@ -1238,14 +1299,7 @@ with ui.ProgressBar(title=u"Import Sheets with Views", cancellable=True, step=5)
                                                       u"Failed to move from sheet {}: {}".format(other_num, str(e))))
                     else:
                         vp = DB.Viewport.Create(doc, target_sheet.Id, target_view.Id, center)
-                        if DO_POSITION:
-                            vp.SetBoxCenter(center)
-                            try:
-                                vp.LabelOffset = DB.XYZ(
-                                    entry.get("label_offset_x", 0),
-                                    entry.get("label_offset_y", 0), 0)
-                            except Exception:
-                                pass
+                        # Order: ChangeTypeId → LabelOffset → title → SetBoxCenter LAST.
                         if DO_VP_TYPE:
                             vt = entry.get("viewport_type", "")
                             if vt and vt in vp_type_by_name:
@@ -1253,6 +1307,13 @@ with ui.ProgressBar(title=u"Import Sheets with Views", cancellable=True, step=5)
                                     vp.ChangeTypeId(vp_type_by_name[vt])
                                 except Exception:
                                     pass
+                        if DO_POSITION:
+                            try:
+                                vp.LabelOffset = DB.XYZ(
+                                    entry.get("label_offset_x", 0),
+                                    entry.get("label_offset_y", 0), 0)
+                            except Exception:
+                                pass
                         title = entry.get("title_on_sheet", "")
                         if title:
                             try:
@@ -1262,6 +1323,17 @@ with ui.ProgressBar(title=u"Import Sheets with Views", cancellable=True, step=5)
                                     p.Set(title)
                             except Exception:
                                 pass
+                        if DO_POSITION:
+                            vp.SetBoxCenter(center)
+                            vp_id_to_target_center[vp.Id.IntegerValue] = center
+                            vp_id_to_source_box[vp.Id.IntegerValue] = (
+                                view_name,
+                                entry.get("box_min_x"), entry.get("box_min_y"),
+                                entry.get("box_max_x"), entry.get("box_max_y"),
+                                entry.get("label_min_x"), entry.get("label_min_y"),
+                                entry.get("label_max_x"), entry.get("label_max_y"),
+                                entry.get("title_on_sheet", u""),
+                                entry.get("detail_number", u""))
                         if DO_DET_NUMBER and target_det:
                             vp_id_to_det_num[vp.Id.IntegerValue] = target_det
                         sheet_results.append(("created", sheet_label, view_name,
@@ -1324,36 +1396,99 @@ with ui.ProgressBar(title=u"Import Sheets with Views", cancellable=True, step=5)
         # T0 cleared the namespace; T1 placed VPs (Revit auto-assigned numbers).
         # Now assign the targets from vp_id_to_det_num and restore original
         # numbers to any pre-existing VP that wasn't given a new target.
-        if not DO_DET_NUMBER or not vp_id_to_det_num:
-            continue
-
-        t2 = DB.Transaction(doc, "Import Sheets with Views T2 - {}".format(sheet_label))
-        try:
-            t2.Start()
-            all_sheet_vps_t2 = list(DB.FilteredElementCollector(doc, target_sheet.Id)
-                                    .OfClass(DB.Viewport).ToElements())
-            ts2 = str(int(time.time())) + "b"
-            for idx, sv in enumerate(all_sheet_vps_t2):
-                set_detail_number(sv, "zzz{}_{}".format(ts2, idx))
-            for sv in all_sheet_vps_t2:
-                vid     = sv.Id.IntegerValue
-                det_num = vp_id_to_det_num.get(vid)
-                if det_num:
-                    set_detail_number(sv, det_num)
-                elif vid in original_numbers:
-                    # Pre-existing VP not getting a new target — restore its
-                    # original number (same pattern as Apply Detail Numbers).
-                    orig = original_numbers[vid]
-                    if orig:
-                        set_detail_number(sv, orig)
-            t2.Commit()
-        except Exception as e:
+        if DO_DET_NUMBER and vp_id_to_det_num:
+            t2 = DB.Transaction(doc, "Import Sheets with Views T2 - {}".format(sheet_label))
             try:
-                if t2.HasStarted() and not t2.HasEnded():
-                    t2.RollBack()
-            except Exception:
-                pass
-            sheet_results.append(("error", sheet_label, u"T2 rolled back", str(e)))
+                t2.Start()
+                all_sheet_vps_t2 = list(DB.FilteredElementCollector(doc, target_sheet.Id)
+                                        .OfClass(DB.Viewport).ToElements())
+                ts2 = str(int(time.time())) + "b"
+                for idx, sv in enumerate(all_sheet_vps_t2):
+                    set_detail_number(sv, "zzz{}_{}".format(ts2, idx))
+                for sv in all_sheet_vps_t2:
+                    vid     = sv.Id.IntegerValue
+                    det_num = vp_id_to_det_num.get(vid)
+                    if det_num:
+                        set_detail_number(sv, det_num)
+                    elif vid in original_numbers:
+                        # Pre-existing VP not getting a new target — restore its
+                        # original number (same pattern as Apply Detail Numbers).
+                        orig = original_numbers[vid]
+                        if orig:
+                            set_detail_number(sv, orig)
+                t2.Commit()
+            except Exception as e:
+                try:
+                    if t2.HasStarted() and not t2.HasEnded():
+                        t2.RollBack()
+                except Exception:
+                    pass
+                sheet_results.append(("error", sheet_label, u"T2 rolled back", str(e)))
+
+        # ══ T3: self-correcting alignment pass ═══════════════════════════════
+        # The destination viewport's BoxOutline often differs slightly in size
+        # from the source's, due to subtle differences between the dependent
+        # views' masters across buildings (rendering, template, etc). Aligning
+        # by box CENTER (T1's SetBoxCenter target) leaves the visible content
+        # offset within the box. The canonical workflow reference is the title's
+        # bottom-right corner — aligning that snaps the crop region's right edge
+        # and the title position to source's, so the content lines up with the
+        # detail lines drawn at world coords on the sheet.
+        #
+        # Anchor: label_max_x (title right edge) + box_min_y (box bottom).
+        # Fallback: box bottom-right, then box center (for old JSON without
+        # box/label outline data).
+        if vp_id_to_target_center:
+            t3 = DB.Transaction(doc, "Import Sheets with Views T3 - align {}".format(sheet_label))
+            try:
+                t3.Start()
+                TOL = 1.0 / 4096.0   # ~0.003" — anything below is sub-pixel noise
+                for _vp_id_int, _target in vp_id_to_target_center.items():
+                    _vp = doc.GetElement(DB.ElementId(_vp_id_int))
+                    if _vp is None:
+                        continue
+                    _src = vp_id_to_source_box.get(_vp_id_int)
+                    # Determine alignment target
+                    if _src and _src[1] is not None:
+                        # New JSON with box (+ optional label) outline data
+                        _src_label_max_x = _src[7] if len(_src) > 7 else None
+                        _tgt_x = _src_label_max_x if _src_label_max_x is not None else _src[3]
+                        _tgt_y = _src[2]   # box_min_y
+                        try:
+                            _d_box = _vp.GetBoxOutline()
+                            try:
+                                _d_lbl = _vp.GetLabelOutline()
+                                _cur_x = _d_lbl.MaximumPoint.X
+                            except Exception:
+                                _cur_x = _d_box.MaximumPoint.X
+                            _cur_y = _d_box.MinimumPoint.Y
+                        except Exception:
+                            continue
+                    else:
+                        # Old JSON — fall back to box-center anchoring
+                        try:
+                            _bc = _vp.GetBoxCenter()
+                            _tgt_x, _tgt_y = _target.X, _target.Y
+                            _cur_x, _cur_y = _bc.X, _bc.Y
+                        except Exception:
+                            continue
+                    _delta_x = _tgt_x - _cur_x
+                    _delta_y = _tgt_y - _cur_y
+                    if abs(_delta_x) < TOL and abs(_delta_y) < TOL:
+                        continue
+                    try:
+                        ElementTransformUtils.MoveElement(
+                            doc, _vp.Id, DB.XYZ(_delta_x, _delta_y, 0))
+                    except Exception:
+                        pass
+                t3.Commit()
+            except Exception as e:
+                try:
+                    if t3.HasStarted() and not t3.HasEnded():
+                        t3.RollBack()
+                except Exception:
+                    pass
+                sheet_results.append(("error", sheet_label, u"T3 rolled back", str(e)))
 
 # ── Reload CD link after import ──────────────────────────────────────────────
 _reload_succeeded = False
@@ -1459,11 +1594,11 @@ class _IssueRow(object):
 
 # Build sheet_results lookup: (sheet_label, view_name) → (status, detail)
 _pb_by_sheet_view = {}
-_sheet_lines      = {}   # sheet_label → "N created / M deleted"
+_sheet_lines      = {}   # sheet_label → "lines redrawn" marker
 _cleaned_by_sheet = {}   # sheet_label → [(view_name, detail), ...]
 for _st, _sl, _vn, _det in sheet_results:
     if _st == "lines":
-        _sheet_lines[_sl] = _vn + u"  /  " + _det
+        _sheet_lines[_sl] = u"lines redrawn"
     elif _st == "cleaned":
         _cleaned_by_sheet.setdefault(_sl, []).append((_vn, _det))
     else:
@@ -1632,70 +1767,66 @@ _BODY_XAML = u"""
     <RowDefinition Height="*"/>
   </Grid.RowDefinitions>
 
-  <!-- Badge row — filterable badges have Cursor="Hand"; click to filter the sheet list -->
-  <StackPanel Grid.Row="0" Orientation="Horizontal" Margin="0,0,0,12">
+  <!-- Badge row — filterable badges have Cursor="Hand"; click to filter the sheet list.
+       WrapPanel auto-wraps to a second row when badges don't fit horizontally. -->
+  <WrapPanel Grid.Row="0" Orientation="Horizontal" Margin="0,0,0,12">
     <Border x:Name="badgeVCreatedBorder" Background="#122E1C" BorderBrush="#50E898"
-            BorderThickness="1" CornerRadius="4" Padding="10,4" Margin="0,0,8,0"
+            BorderThickness="1" CornerRadius="4" Padding="10,4" Margin="0,0,8,6"
             Cursor="Hand">
       <TextBlock x:Name="badgeVCreated" Foreground="#50E898" FontFamily="Segoe UI" FontSize="13"/>
     </Border>
     <Border x:Name="badgeVUpdatedBorder" Background="#142244" BorderBrush="#7EB4F0"
-            BorderThickness="1" CornerRadius="4" Padding="10,4" Margin="0,0,8,0"
+            BorderThickness="1" CornerRadius="4" Padding="10,4" Margin="0,0,8,6"
             Cursor="Hand">
       <TextBlock x:Name="badgeVUpdated" Foreground="#7EB4F0" FontFamily="Segoe UI" FontSize="13"/>
     </Border>
     <Border x:Name="badgeVSkippedBorder" Background="#1E2740" BorderBrush="#6B7394"
-            BorderThickness="1" CornerRadius="4" Padding="10,4" Margin="0,0,8,0"
+            BorderThickness="1" CornerRadius="4" Padding="10,4" Margin="0,0,8,6"
             Cursor="Hand">
       <TextBlock x:Name="badgeVSkipped" Foreground="#6B7394" FontFamily="Segoe UI" FontSize="13"/>
     </Border>
     <Border x:Name="badgeSVPBorder" Background="#1A2535" BorderBrush="#5B8EC4"
-            BorderThickness="1" CornerRadius="4" Padding="10,4" Margin="0,0,8,0"
+            BorderThickness="1" CornerRadius="4" Padding="10,4" Margin="0,0,8,6"
             Cursor="Hand">
       <TextBlock x:Name="badgeSVP" Foreground="#5B8EC4" FontFamily="Segoe UI" FontSize="13"/>
     </Border>
     <Border x:Name="badgeMovedBorder" Background="#2A1800" BorderBrush="#E87E20"
-            BorderThickness="1" CornerRadius="4" Padding="10,4" Margin="0,0,8,0"
+            BorderThickness="1" CornerRadius="4" Padding="10,4" Margin="0,0,8,6"
             Cursor="Hand" Visibility="Collapsed">
       <TextBlock x:Name="badgeMoved" Foreground="#E87E20" FontFamily="Segoe UI" FontSize="13"/>
     </Border>
     <Border x:Name="badgeLinesBorder" Background="#0F3038" BorderBrush="#5ED4E6"
-            BorderThickness="1" CornerRadius="4" Padding="10,4" Margin="0,0,8,0"
+            BorderThickness="1" CornerRadius="4" Padding="10,4" Margin="0,0,8,6"
             Visibility="Collapsed">
       <TextBlock x:Name="badgeLines" Foreground="#5ED4E6" FontFamily="Segoe UI" FontSize="13"/>
     </Border>
     <Border x:Name="badgeIdBorder" Background="#4A3810" BorderBrush="#FFCC66"
-            BorderThickness="1" CornerRadius="4" Padding="10,4" Margin="0,0,8,0"
+            BorderThickness="1" CornerRadius="4" Padding="10,4" Margin="0,0,8,6"
             Visibility="Collapsed">
       <TextBlock x:Name="badgeIds" Foreground="#FFCC66" FontFamily="Segoe UI" FontSize="13"/>
     </Border>
-    <Border x:Name="badgeCropBorder" Background="#2A1E40" BorderBrush="#B8A0E8"
-            BorderThickness="1" CornerRadius="4" Padding="10,4" Margin="0,0,8,0"
-            Visibility="Collapsed">
-      <TextBlock x:Name="badgeCrop" Foreground="#B8A0E8" FontFamily="Segoe UI" FontSize="13"/>
-    </Border>
     <Border x:Name="badgeTypeFixedBorder" Background="#2E0F0F" BorderBrush="#FF6B6B"
-            BorderThickness="1" CornerRadius="4" Padding="10,4" Margin="0,0,8,0"
+            BorderThickness="1" CornerRadius="4" Padding="10,4" Margin="0,0,8,6"
             Cursor="Hand" Visibility="Collapsed">
       <TextBlock x:Name="badgeTypeFixed" Foreground="#FF6B6B" FontFamily="Segoe UI" FontSize="13"/>
     </Border>
     <Border x:Name="badgeScaleFixedBorder" Background="#2E1F0A" BorderBrush="#F0A050"
-            BorderThickness="1" CornerRadius="4" Padding="10,4" Margin="0,0,8,0"
+            BorderThickness="1" CornerRadius="4" Padding="10,4" Margin="0,0,8,6"
             Cursor="Hand" Visibility="Collapsed">
       <TextBlock x:Name="badgeScaleFixed" Foreground="#F0A050" FontFamily="Segoe UI" FontSize="13"/>
     </Border>
     <Border x:Name="badgeRenamedBorder" Background="#0F2A2E" BorderBrush="#5ED4D4"
-            BorderThickness="1" CornerRadius="4" Padding="10,4" Margin="0,0,8,0"
+            BorderThickness="1" CornerRadius="4" Padding="10,4" Margin="0,0,8,6"
             Cursor="Hand" Visibility="Collapsed">
       <TextBlock x:Name="badgeRenamed" Foreground="#5ED4D4" FontFamily="Segoe UI" FontSize="13"/>
     </Border>
     <Border x:Name="badgeOldMarkedBorder" Background="#1F1F25" BorderBrush="#9099C8"
-            BorderThickness="1" CornerRadius="4" Padding="10,4" Margin="0,0,8,0"
+            BorderThickness="1" CornerRadius="4" Padding="10,4" Margin="0,0,8,6"
             Visibility="Collapsed">
       <TextBlock x:Name="badgeOldMarked" Foreground="#9099C8" FontFamily="Segoe UI" FontSize="13"/>
     </Border>
     <Border x:Name="badgeVPCleanedBorder" Background="#0F1F2E" BorderBrush="#7AB8E0"
-            BorderThickness="1" CornerRadius="4" Padding="10,4" Margin="0,0,8,0"
+            BorderThickness="1" CornerRadius="4" Padding="10,4" Margin="0,0,8,6"
             Cursor="Hand" Visibility="Collapsed">
       <TextBlock x:Name="badgeVPCleaned" Foreground="#7AB8E0" FontFamily="Segoe UI" FontSize="13"/>
     </Border>
@@ -1705,14 +1836,14 @@ _BODY_XAML = u"""
       <TextBlock x:Name="badgeErrors" Foreground="#FF7070" FontFamily="Segoe UI" FontSize="13"/>
     </Border>
     <Border x:Name="badgeLinkBorder" BorderThickness="1" CornerRadius="4"
-            Padding="10,4" Margin="0,0,8,0" Visibility="Collapsed">
+            Padding="10,4" Margin="0,0,8,6" Visibility="Collapsed">
       <TextBlock x:Name="badgeLink" FontFamily="Segoe UI" FontSize="13"/>
     </Border>
-  </StackPanel>
+  </WrapPanel>
 
   <!-- Issues section (skip_master + view errors) — only shown when there are issues -->
   <Border Grid.Row="1" x:Name="issuesBorder" Visibility="Collapsed" Margin="0,0,0,8">
-    <Expander IsExpanded="False">
+    <Expander x:Name="issuesExpander" IsExpanded="True">
       <Expander.Header>
         <StackPanel Orientation="Horizontal">
           <Border Background="#3C1212" BorderBrush="#FF7070" BorderThickness="1"
@@ -1772,7 +1903,7 @@ _BODY_XAML = u"""
                 <TextBlock Text="{Binding SheetName}" Foreground="#E8EBF5"
                            FontFamily="Segoe UI" FontSize="13"
                            VerticalAlignment="Center" Margin="0,0,12,0"/>
-                <Border Background="#1A1D30" CornerRadius="4" Padding="7,2" Margin="0,0,8,0">
+                <Border Background="#1A1D30" CornerRadius="4" Padding="7,2" Margin="0,0,8,6">
                   <TextBlock Text="{Binding Count}" Foreground="#6B7394"
                              FontFamily="Segoe UI" FontSize="11"/>
                 </Border>
@@ -1859,14 +1990,16 @@ if vp_moved:
     win.FindName("badgeMovedBorder").Visibility = Visibility.Visible
     win.FindName("badgeMoved").Text = u"🚚  {} moved".format(vp_moved)
 if dl_created:
+    # Count distinct sheets that had their detail lines redrawn (more useful
+    # than total line count — the per-sheet expander has the line counts).
+    _sheets_with_lines = len({_sl for _st, _sl, _vn, _det in sheet_results
+                              if _st == "lines"})
     win.FindName("badgeLinesBorder").Visibility = Visibility.Visible
-    win.FindName("badgeLines").Text = u"📐  {} lines".format(dl_created)
+    win.FindName("badgeLines").Text = u"📐  lines redrawn on {} sheet{}".format(
+        _sheets_with_lines, u"s" if _sheets_with_lines != 1 else u"")
 if total_id_stamped:
     win.FindName("badgeIdBorder").Visibility = Visibility.Visible
     win.FindName("badgeIds").Text = u"🔖  {} IDs stamped".format(total_id_stamped)
-if total_crop_adjusted:
-    win.FindName("badgeCropBorder").Visibility = Visibility.Visible
-    win.FindName("badgeCrop").Text = u"✂️  {} crops set".format(total_crop_adjusted)
 if n_type_fixed:
     win.FindName("badgeTypeFixedBorder").Visibility = Visibility.Visible
     win.FindName("badgeTypeFixed").Text = u"⛔  {} type-fixed".format(n_type_fixed)

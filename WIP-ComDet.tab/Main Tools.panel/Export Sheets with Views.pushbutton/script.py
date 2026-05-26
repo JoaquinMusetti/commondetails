@@ -326,6 +326,23 @@ with ui.ProgressBar(title=u"Building sheet layout", cancellable=False, step=1) a
             continue
         v      = dep_view_by_id[view_id]
         center = vp.GetBoxCenter()
+        # Capture BoxOutline + LabelOutline for diagnostic comparison in import
+        try:
+            _out = vp.GetBoxOutline()
+            _bo_min_x = _out.MinimumPoint.X
+            _bo_min_y = _out.MinimumPoint.Y
+            _bo_max_x = _out.MaximumPoint.X
+            _bo_max_y = _out.MaximumPoint.Y
+        except Exception:
+            _bo_min_x = _bo_min_y = _bo_max_x = _bo_max_y = None
+        try:
+            _lout = vp.GetLabelOutline()
+            _lo_min_x = _lout.MinimumPoint.X
+            _lo_min_y = _lout.MinimumPoint.Y
+            _lo_max_x = _lout.MaximumPoint.X
+            _lo_max_y = _lout.MaximumPoint.Y
+        except Exception:
+            _lo_min_x = _lo_min_y = _lo_max_x = _lo_max_y = None
         try:
             label_x = vp.LabelOffset.X
             label_y = vp.LabelOffset.Y
@@ -358,6 +375,15 @@ with ui.ProgressBar(title=u"Building sheet layout", cancellable=False, step=1) a
             "title_on_sheet":    title_on_sheet,
             "detail_number":     detail_number,
             "view_type":         str(v.ViewType),
+            # Diagnostic — BoxOutline + LabelOutline dimensions on the source sheet
+            "box_min_x":         _bo_min_x,
+            "box_min_y":         _bo_min_y,
+            "box_max_x":         _bo_max_x,
+            "box_max_y":         _bo_max_y,
+            "label_min_x":       _lo_min_x,
+            "label_min_y":       _lo_min_y,
+            "label_max_x":       _lo_max_x,
+            "label_max_y":       _lo_max_y,
         })
     for dl in _sheet_detail_lines.get(sheet.Id.IntegerValue, []):
         try:

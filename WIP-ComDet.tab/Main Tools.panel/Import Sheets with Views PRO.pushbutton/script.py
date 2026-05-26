@@ -12,7 +12,8 @@ import os as _os
 import time
 from pyrevit import revit, DB, script, forms, HOST_APP
 from Autodesk.Revit.DB import (CurveLoop, Line, ViewDuplicateOption,
-                                BuiltInParameterGroup, BuiltInCategory)
+                                BuiltInParameterGroup, BuiltInCategory,
+                                ElementTransformUtils)
 from System.Windows import Visibility
 
 _script_dir = _os.path.dirname(_os.path.abspath(__file__))
@@ -416,10 +417,14 @@ def import_one_doc(target_doc, dest_prefix, link_instance_name, data_in, pb, tot
         "v_created":     0,
         "v_updated":     0,
         "v_skipped":     0,
+        "v_recreated":   0,   # pre-flight auto-fix: deleted + recreated due to scale mismatch
+        "v_renamed":     0,   # pre-flight auto-fix: renamed to match JSON name
         "ids_stamped":   0,
         "crop_adjusted": 0,
         "vp_created":    0,
         "vp_updated":    0,
+        "vp_moved":      0,   # viewport relocated from another sheet
+        "vp_cleaned":    0,   # Phase B.0 orphan viewports removed from sheets
         "dl_created":    0,
         "dl_deleted":    0,
         "errors":        0,
@@ -546,7 +551,7 @@ def import_one_doc(target_doc, dest_prefix, link_instance_name, data_in, pb, tot
                 continue
             master_view = view_by_name[view_name]
 
-            existing_by_id   = {}
+            existing_by_id   = {}   # Detail ID → LIST of dep views (handles duplicates)
             existing_by_name = {}
             for vid in master_view.GetDependentViewIds():
                 dep = target_doc.GetElement(vid)
@@ -554,7 +559,7 @@ def import_one_doc(target_doc, dest_prefix, link_instance_name, data_in, pb, tot
                     existing_by_name[dep.Name] = dep
                     did = get_detail_id(dep)
                     if did:
-                        existing_by_id[did] = dep
+                        existing_by_id.setdefault(did, []).append(dep)
 
             pending_crops = []
             for dv_data in view_data["dependent_views"]:
@@ -570,7 +575,19 @@ def import_one_doc(target_doc, dest_prefix, link_instance_name, data_in, pb, tot
                 corners_world  = [link_to_world(c, link_transform)
                                   for c in dv_data["crop_corners"]]
 
-                existing_view = existing_by_id.get(dv_id) if dv_id else None
+                # Precedence: exact (ID+name) > ID-only (only if unambiguous) > name-only.
+                # Multiple views can share a Detail ID (e.g. user duplicated one).
+                # Prefer the one whose name matches; if none match and there are
+                # multiple candidates, treat as ambiguous and fall back to name-only.
+                existing_view = None
+                if dv_id:
+                    _id_candidates = existing_by_id.get(dv_id, [])
+                    for _c in _id_candidates:
+                        if _c.Name == dv_name:
+                            existing_view = _c
+                            break
+                    if existing_view is None and len(_id_candidates) == 1:
+                        existing_view = _id_candidates[0]
                 if existing_view is None:
                     existing_view = existing_by_name.get(dv_name)
 
@@ -579,6 +596,58 @@ def import_one_doc(target_doc, dest_prefix, link_instance_name, data_in, pb, tot
                     target_doc.Title, processed_local, total_views, dv_name)
                 pb.update_progress(base_progress + processed_local,
                                    base_progress + total_views + total_sheets)
+
+                if existing_view is not None:
+                    # ── Pre-flight auto-fix: scale mismatch → delete + recreate ──
+                    # If destination view's scale differs from JSON's, delete it so
+                    # Phase A's create path runs below with the correct scale.
+                    try:
+                        _ev_scale = existing_view.Scale
+                    except Exception:
+                        _ev_scale = None
+                    if scale and _ev_scale is not None and _ev_scale != scale:
+                        try:
+                            _ev_name_old = existing_view.Name
+                            target_doc.Delete(existing_view.Id)
+                            existing_proj_names.discard(_ev_name_old)
+                            dep_view_by_name.pop(_ev_name_old, None)
+                            # Also invalidate viewport_by_view_id cache for this view
+                            viewport_by_view_id.pop(existing_view.Id.IntegerValue, None)
+                            res["v_recreated"] += 1
+                            existing_view = None
+                        except Exception:
+                            pass
+
+                if existing_view is not None:
+                    # ── Pre-flight auto-fix: name mismatch → rename ──
+                    # If matched by detail_id but name differs, rename to match JSON.
+                    # Handle collision by renaming the colliding view to "(old)".
+                    if existing_view.Name != dv_name:
+                        try:
+                            _collider = dep_view_by_name.get(dv_name)
+                            if _collider is not None and _collider.Id != existing_view.Id:
+                                _old_name = u"{} (old)".format(dv_name)
+                                _n = 2
+                                while _old_name in existing_proj_names:
+                                    _old_name = u"{} (old {})".format(dv_name, _n)
+                                    _n += 1
+                                try:
+                                    _collider.Name = _old_name
+                                    existing_proj_names.discard(dv_name)
+                                    existing_proj_names.add(_old_name)
+                                    dep_view_by_name.pop(dv_name, None)
+                                    dep_view_by_name[_old_name] = _collider
+                                except Exception:
+                                    pass
+                            _ev_old_name = existing_view.Name
+                            existing_view.Name = dv_name
+                            existing_proj_names.discard(_ev_old_name)
+                            existing_proj_names.add(dv_name)
+                            dep_view_by_name.pop(_ev_old_name, None)
+                            dep_view_by_name[dv_name] = existing_view
+                            res["v_renamed"] += 1
+                        except Exception:
+                            pass
 
                 if existing_view is not None:
                     if dv_id and not get_detail_id(existing_view):
@@ -693,6 +762,55 @@ def import_one_doc(target_doc, dest_prefix, link_instance_name, data_in, pb, tot
         target_sheet     = sheet_by_suffix[suffix]
         vp_id_to_det_num = {}
         original_numbers = {}
+        vp_id_to_target_center = {}   # VP id → DB.XYZ target box center (T3 fallback)
+        vp_id_to_source_box    = {}   # VP id → (name, box_min/max + label_min/max from JSON)
+
+        # ══ B.0: clean orphan viewports ══════════════════════════════════════
+        # Per-sheet: any viewport on this sheet whose view is NOT in this sheet's
+        # JSON viewports list gets removed. The View element itself is kept —
+        # only the placement on this sheet goes away. This prevents stale
+        # viewports from accumulating across re-imports and properly handles
+        # views that moved to a different sheet between source and destination.
+        _json_view_ids_this_sheet = set()
+        for _vp_entry in sheet_data["viewports"]:
+            _tv = dep_view_by_name.get(_vp_entry["view_name"])
+            if _tv is not None:
+                _json_view_ids_this_sheet.add(_tv.Id.IntegerValue)
+
+        _orphan_vps = []
+        for _vp in DB.FilteredElementCollector(target_doc, target_sheet.Id).OfClass(DB.Viewport).ToElements():
+            if _vp.ViewId.IntegerValue not in _json_view_ids_this_sheet:
+                _orphan_vps.append(_vp)
+
+        if _orphan_vps:
+            _b0 = DB.Transaction(target_doc, "Import PRO B0 — clean orphans {} / {}".format(
+                target_doc.Title, sheet_label))
+            try:
+                _b0.Start()
+                for _vp in _orphan_vps:
+                    _vid_int  = _vp.ViewId.IntegerValue
+                    _vp_id_int = _vp.Id.IntegerValue
+                    try:
+                        target_doc.Delete(_vp.Id)
+                    except Exception:
+                        res["errors"] += 1
+                        continue
+                    # Cache invalidation — don't touch the deleted Viewport object.
+                    try:
+                        _cached = viewport_by_view_id.get(_vid_int)
+                        if _cached is not None and _cached.Id.IntegerValue == _vp_id_int:
+                            del viewport_by_view_id[_vid_int]
+                    except Exception:
+                        viewport_by_view_id.pop(_vid_int, None)
+                    res["vp_cleaned"] += 1
+                _b0.Commit()
+            except Exception:
+                try:
+                    if _b0.HasStarted() and not _b0.HasEnded():
+                        _b0.RollBack()
+                except Exception:
+                    pass
+                res["errors"] += 1
 
         # ══ T0: free up detail-number namespace ═════════════════════════════
         if DO_DET_NUMBER:
@@ -739,14 +857,9 @@ def import_one_doc(target_doc, dest_prefix, link_instance_name, data_in, pb, tot
                     if target_view.Id.IntegerValue in viewport_by_view_id:
                         existing_vp = viewport_by_view_id[target_view.Id.IntegerValue]
                         if existing_vp.SheetId.IntegerValue == target_sheet.Id.IntegerValue:
-                            if DO_POSITION:
-                                existing_vp.SetBoxCenter(center)
-                                try:
-                                    existing_vp.LabelOffset = DB.XYZ(
-                                        entry.get("label_offset_x", 0),
-                                        entry.get("label_offset_y", 0), 0)
-                                except Exception:
-                                    pass
+                            # Order: ChangeTypeId → LabelOffset → title → SetBoxCenter LAST.
+                            # SetBoxCenter must be the final operation; LabelOffset and type
+                            # change can shift the box outline and invalidate an earlier center.
                             if DO_VP_TYPE:
                                 vt = entry.get("viewport_type", "")
                                 if vt and vt in vp_type_by_name:
@@ -754,6 +867,13 @@ def import_one_doc(target_doc, dest_prefix, link_instance_name, data_in, pb, tot
                                         existing_vp.ChangeTypeId(vp_type_by_name[vt])
                                     except Exception:
                                         pass
+                            if DO_POSITION:
+                                try:
+                                    existing_vp.LabelOffset = DB.XYZ(
+                                        entry.get("label_offset_x", 0),
+                                        entry.get("label_offset_y", 0), 0)
+                                except Exception:
+                                    pass
                             if DO_TITLE:
                                 title = entry.get("title_on_sheet", "")
                                 if title:
@@ -764,21 +884,66 @@ def import_one_doc(target_doc, dest_prefix, link_instance_name, data_in, pb, tot
                                             p.Set(title)
                                     except Exception:
                                         pass
+                            if DO_POSITION:
+                                existing_vp.SetBoxCenter(center)
+                                vp_id_to_target_center[existing_vp.Id.IntegerValue] = center
+                                vp_id_to_source_box[existing_vp.Id.IntegerValue] = (
+                                    view_name,
+                                    entry.get("box_min_x"), entry.get("box_min_y"),
+                                    entry.get("box_max_x"), entry.get("box_max_y"),
+                                    entry.get("label_min_x"), entry.get("label_min_y"),
+                                    entry.get("label_max_x"), entry.get("label_max_y"))
                             if DO_DET_NUMBER and target_det:
                                 vp_id_to_det_num[existing_vp.Id.IntegerValue] = target_det
                             res["vp_updated"] += 1
                         else:
-                            res["warnings"] += 1
+                            # ── Moved path: view is on a DIFFERENT sheet — relocate it ──
+                            # Delete the old viewport on the other sheet and create a fresh
+                            # one on the target sheet. The View element itself stays alive.
+                            try:
+                                target_doc.Delete(existing_vp.Id)
+                                viewport_by_view_id.pop(target_view.Id.IntegerValue, None)
+                                vp = DB.Viewport.Create(target_doc, target_sheet.Id, target_view.Id, center)
+                                if DO_VP_TYPE:
+                                    vt = entry.get("viewport_type", "")
+                                    if vt and vt in vp_type_by_name:
+                                        try:
+                                            vp.ChangeTypeId(vp_type_by_name[vt])
+                                        except Exception:
+                                            pass
+                                if DO_POSITION:
+                                    try:
+                                        vp.LabelOffset = DB.XYZ(
+                                            entry.get("label_offset_x", 0),
+                                            entry.get("label_offset_y", 0), 0)
+                                    except Exception:
+                                        pass
+                                title = entry.get("title_on_sheet", "")
+                                if DO_TITLE and title:
+                                    try:
+                                        p = target_view.get_Parameter(
+                                            DB.BuiltInParameter.VIEW_DESCRIPTION)
+                                        if p and not p.IsReadOnly:
+                                            p.Set(title)
+                                    except Exception:
+                                        pass
+                                if DO_POSITION:
+                                    vp.SetBoxCenter(center)
+                                    vp_id_to_target_center[vp.Id.IntegerValue] = center
+                                    vp_id_to_source_box[vp.Id.IntegerValue] = (
+                                        view_name,
+                                        entry.get("box_min_x"), entry.get("box_min_y"),
+                                        entry.get("box_max_x"), entry.get("box_max_y"),
+                                        entry.get("label_min_x"), entry.get("label_min_y"),
+                                        entry.get("label_max_x"), entry.get("label_max_y"))
+                                if DO_DET_NUMBER and target_det:
+                                    vp_id_to_det_num[vp.Id.IntegerValue] = target_det
+                                res["vp_moved"] += 1
+                            except Exception:
+                                res["errors"] += 1
                     else:
                         vp = DB.Viewport.Create(target_doc, target_sheet.Id, target_view.Id, center)
-                        if DO_POSITION:
-                            vp.SetBoxCenter(center)
-                            try:
-                                vp.LabelOffset = DB.XYZ(
-                                    entry.get("label_offset_x", 0),
-                                    entry.get("label_offset_y", 0), 0)
-                            except Exception:
-                                pass
+                        # Order: ChangeTypeId → LabelOffset → title → SetBoxCenter LAST.
                         if DO_VP_TYPE:
                             vt = entry.get("viewport_type", "")
                             if vt and vt in vp_type_by_name:
@@ -786,6 +951,13 @@ def import_one_doc(target_doc, dest_prefix, link_instance_name, data_in, pb, tot
                                     vp.ChangeTypeId(vp_type_by_name[vt])
                                 except Exception:
                                     pass
+                        if DO_POSITION:
+                            try:
+                                vp.LabelOffset = DB.XYZ(
+                                    entry.get("label_offset_x", 0),
+                                    entry.get("label_offset_y", 0), 0)
+                            except Exception:
+                                pass
                         title = entry.get("title_on_sheet", "")
                         if title:
                             try:
@@ -795,6 +967,15 @@ def import_one_doc(target_doc, dest_prefix, link_instance_name, data_in, pb, tot
                                     p.Set(title)
                             except Exception:
                                 pass
+                        if DO_POSITION:
+                            vp.SetBoxCenter(center)
+                            vp_id_to_target_center[vp.Id.IntegerValue] = center
+                            vp_id_to_source_box[vp.Id.IntegerValue] = (
+                                view_name,
+                                entry.get("box_min_x"), entry.get("box_min_y"),
+                                entry.get("box_max_x"), entry.get("box_max_y"),
+                                entry.get("label_min_x"), entry.get("label_min_y"),
+                                entry.get("label_max_x"), entry.get("label_max_y"))
                         if DO_DET_NUMBER and target_det:
                             vp_id_to_det_num[vp.Id.IntegerValue] = target_det
                         res["vp_created"] += 1
@@ -844,34 +1025,93 @@ def import_one_doc(target_doc, dest_prefix, link_instance_name, data_in, pb, tot
             continue
 
         # ══ T2: assign final detail numbers ═════════════════════════════════
-        if not DO_DET_NUMBER or not vp_id_to_det_num:
-            continue
-        t2 = DB.Transaction(target_doc, "Import PRO T2 — {} / {}".format(
-            target_doc.Title, sheet_label))
-        try:
-            t2.Start()
-            all_sheet_vps_t2 = list(DB.FilteredElementCollector(target_doc, target_sheet.Id)
-                                    .OfClass(DB.Viewport).ToElements())
-            ts2 = str(int(time.time())) + "b"
-            for idx, sv in enumerate(all_sheet_vps_t2):
-                set_detail_number(sv, "zzz{}_{}".format(ts2, idx))
-            for sv in all_sheet_vps_t2:
-                vid     = sv.Id.IntegerValue
-                det_num = vp_id_to_det_num.get(vid)
-                if det_num:
-                    set_detail_number(sv, det_num)
-                elif vid in original_numbers:
-                    orig = original_numbers[vid]
-                    if orig:
-                        set_detail_number(sv, orig)
-            t2.Commit()
-        except Exception:
+        if DO_DET_NUMBER and vp_id_to_det_num:
+            t2 = DB.Transaction(target_doc, "Import PRO T2 — {} / {}".format(
+                target_doc.Title, sheet_label))
             try:
-                if t2.HasStarted() and not t2.HasEnded():
-                    t2.RollBack()
+                t2.Start()
+                all_sheet_vps_t2 = list(DB.FilteredElementCollector(target_doc, target_sheet.Id)
+                                        .OfClass(DB.Viewport).ToElements())
+                ts2 = str(int(time.time())) + "b"
+                for idx, sv in enumerate(all_sheet_vps_t2):
+                    set_detail_number(sv, "zzz{}_{}".format(ts2, idx))
+                for sv in all_sheet_vps_t2:
+                    vid     = sv.Id.IntegerValue
+                    det_num = vp_id_to_det_num.get(vid)
+                    if det_num:
+                        set_detail_number(sv, det_num)
+                    elif vid in original_numbers:
+                        orig = original_numbers[vid]
+                        if orig:
+                            set_detail_number(sv, orig)
+                t2.Commit()
             except Exception:
-                pass
-            res["errors"] += 1
+                try:
+                    if t2.HasStarted() and not t2.HasEnded():
+                        t2.RollBack()
+                except Exception:
+                    pass
+                res["errors"] += 1
+
+        # ══ T3: self-correcting alignment pass ═══════════════════════════════
+        # Box outline of destination viewports often differs slightly in size
+        # from source's (master view rendering quirks across buildings). Aligning
+        # by box CENTER leaves visible content offset within the box. Anchor by
+        # the title's bottom-right corner (label_max_x + box_min_y) — that snaps
+        # the crop region's right edge and the title to source's position, so
+        # the rendered content lines up with the detail lines on the sheet.
+        # Fallback chain: label_max_x → box_max_x → box center (old JSON).
+        if vp_id_to_target_center:
+            t3 = DB.Transaction(target_doc, "Import PRO T3 — align {} / {}".format(
+                target_doc.Title, sheet_label))
+            try:
+                t3.Start()
+                TOL = 1.0 / 4096.0   # ~0.003" — sub-pixel noise threshold
+                for _vp_id_int, _target in vp_id_to_target_center.items():
+                    _vp = target_doc.GetElement(DB.ElementId(_vp_id_int))
+                    if _vp is None:
+                        continue
+                    _src = vp_id_to_source_box.get(_vp_id_int)
+                    if _src and _src[1] is not None:
+                        # New JSON with box (+ optional label) outline data
+                        _src_label_max_x = _src[7] if len(_src) > 7 else None
+                        _tgt_x = _src_label_max_x if _src_label_max_x is not None else _src[3]
+                        _tgt_y = _src[2]   # box_min_y
+                        try:
+                            _d_box = _vp.GetBoxOutline()
+                            try:
+                                _d_lbl = _vp.GetLabelOutline()
+                                _cur_x = _d_lbl.MaximumPoint.X
+                            except Exception:
+                                _cur_x = _d_box.MaximumPoint.X
+                            _cur_y = _d_box.MinimumPoint.Y
+                        except Exception:
+                            continue
+                    else:
+                        # Old JSON — fall back to box-center anchoring
+                        try:
+                            _bc = _vp.GetBoxCenter()
+                            _tgt_x, _tgt_y = _target.X, _target.Y
+                            _cur_x, _cur_y = _bc.X, _bc.Y
+                        except Exception:
+                            continue
+                    _delta_x = _tgt_x - _cur_x
+                    _delta_y = _tgt_y - _cur_y
+                    if abs(_delta_x) < TOL and abs(_delta_y) < TOL:
+                        continue
+                    try:
+                        ElementTransformUtils.MoveElement(
+                            target_doc, _vp.Id, DB.XYZ(_delta_x, _delta_y, 0))
+                    except Exception:
+                        pass
+                t3.Commit()
+            except Exception:
+                try:
+                    if t3.HasStarted() and not t3.HasEnded():
+                        t3.RollBack()
+                except Exception:
+                    pass
+                res["errors"] += 1
 
     return res
 
@@ -908,10 +1148,14 @@ agg = {
     "v_created":     sum(r["v_created"]     for r in all_results),
     "v_updated":     sum(r["v_updated"]     for r in all_results),
     "v_skipped":     sum(r["v_skipped"]     for r in all_results),
+    "v_recreated":   sum(r.get("v_recreated", 0) for r in all_results),
+    "v_renamed":     sum(r.get("v_renamed", 0)   for r in all_results),
     "crop_adjusted": sum(r["crop_adjusted"] for r in all_results),
     "ids_stamped":   sum(r["ids_stamped"]   for r in all_results),
     "vp_created":    sum(r["vp_created"]    for r in all_results),
     "vp_updated":    sum(r["vp_updated"]    for r in all_results),
+    "vp_moved":      sum(r.get("vp_moved", 0)   for r in all_results),
+    "vp_cleaned":    sum(r.get("vp_cleaned", 0) for r in all_results),
     "dl_created":    sum(r["dl_created"]    for r in all_results),
     "errors":        sum(r["errors"]        for r in all_results),
     "warnings":      sum(r["warnings"]      for r in all_results),
@@ -928,14 +1172,19 @@ lines_out = [
     u"Aggregated totals:",
     u"  ✅ {} views created    🔄 {} updated    ⏭ {} skipped".format(
         agg["v_created"], agg["v_updated"], agg["v_skipped"]),
+]
+if agg["v_recreated"] or agg["v_renamed"]:
+    lines_out.append(u"  ⛔ {} views recreated (scale-fix)    ✏ {} renamed (name-fix)".format(
+        agg["v_recreated"], agg["v_renamed"]))
+lines_out.extend([
     u"  ✂️ {} crops adjusted    🔖 {} IDs stamped".format(
         agg["crop_adjusted"], agg["ids_stamped"]),
-    u"  📄 {} viewports placed    🔄 {} viewports updated    📐 {} detail lines drawn".format(
-        agg["vp_created"], agg["vp_updated"], agg["dl_created"]),
+    u"  📄 {} viewports placed    🔄 {} updated    🚚 {} relocated    🧹 {} cleaned    📐 lines on changed sheets".format(
+        agg["vp_created"], agg["vp_updated"], agg["vp_moved"], agg["vp_cleaned"]),
     u"  ❌ {} errors    ⚠ {} warnings".format(agg["errors"], agg["warnings"]),
     u"",
     u"Per-document:",
-]
+])
 for r in all_results:
     lines_out.append(u"")
     lines_out.append(u"  • {}   [prefix: {}   link: {}]".format(
@@ -943,14 +1192,20 @@ for r in all_results:
     if r.get("skipped_reason"):
         lines_out.append(u"      ⚠ SKIPPED: {}".format(r["skipped_reason"]))
         continue
+    _vrec = r.get("v_recreated", 0)
+    _vren = r.get("v_renamed", 0)
+    _vfix_str = u""
+    if _vrec or _vren:
+        _vfix_str = u"  ⛔{} ✏{}".format(_vrec, _vren)
     lines_out.append(
-        u"      views   created={}  updated={}  skipped={}  crops_adj={}  ids={}".format(
-            r["v_created"], r["v_updated"], r["v_skipped"],
+        u"      views   created={}  updated={}  skipped={}{}  crops_adj={}  ids={}".format(
+            r["v_created"], r["v_updated"], r["v_skipped"], _vfix_str,
             r["crop_adjusted"], r["ids_stamped"]))
     lines_out.append(
-        u"      sheets  vp_created={}  vp_updated={}  dl_created={}  errors={}  warnings={}".format(
-            r["vp_created"], r["vp_updated"], r["dl_created"],
-            r["errors"], r["warnings"]))
+        u"      sheets  vp_created={}  vp_updated={}  vp_moved={}  vp_cleaned={}  dl_created={}  errors={}  warnings={}".format(
+            r["vp_created"], r["vp_updated"],
+            r.get("vp_moved", 0), r.get("vp_cleaned", 0),
+            r["dl_created"], r["errors"], r["warnings"]))
     if r.get("cancelled"):
         lines_out.append(u"      ⚠ Cancelled mid-doc — partial work committed.")
 
