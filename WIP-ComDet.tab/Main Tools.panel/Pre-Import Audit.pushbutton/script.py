@@ -100,6 +100,27 @@ if not dest_prefix:
 
 dest_prefix = dest_prefix.strip().upper()
 
+# Filter JSON sheets to this building. A Common Details export carries sheets
+# for every building (AA, AE, AB, AG…) plus shared AX details; without this
+# filter their suffixes collide (all map to the same dest sheet number).
+SHARED_PREFIX = u"AX"
+_full_count = len(layout)
+layout = [sd for sd in layout
+          if sd.get("sheet_number", u"")[:2].upper() in (dest_prefix, SHARED_PREFIX)]
+skipped = _full_count - len(layout)
+
+if not layout:
+    ui.alert(
+        u"No sheets in the JSON match prefix '{}' or the shared '{}' prefix.\n\n"
+        u"The JSON has {} sheet(s) for other buildings. Check that you entered "
+        u"the right destination prefix.".format(dest_prefix, SHARED_PREFIX, _full_count),
+        title=u"Pre-Import Audit",
+        context=u"This export contains custom details for multiple buildings. "
+                u"The audit only processes sheets whose number starts with the "
+                u"destination prefix you entered or the shared 'AX' prefix."
+    )
+    script.exit()
+
 # ─────────────────────────────────────────────────────────────────────────────
 # 3. Cache-building helper (called at startup and after sheet creation)
 # ─────────────────────────────────────────────────────────────────────────────
@@ -466,6 +487,9 @@ elif n_not_found > 0 and (n_issues - n_not_found) == 0:
 else:
     subtitle = u"{} sheets  ·  prefix {}  ·  {}".format(
         len(layout), dest_prefix, _os.path.basename(json_path))
+
+if skipped:
+    subtitle += u"  ·  ignored {} from other buildings".format(skipped)
 
 # ─────────────────────────────────────────────────────────────────────────────
 # 7. Build WPF window
@@ -847,9 +871,23 @@ if not_found_oc.Count > 0:
 # ─── Create sheets handler ─────────────────────────────────────────────────────
 
 def on_create_sheets(s, e):
-    to_create = list(not_found_list)
-    if not to_create:
+    if not not_found_list:
         return
+
+    # Let the user choose which missing sheets to create (use "Select all" for all)
+    chosen = ui.pick_list(
+        list(not_found_list),
+        u"Which sheets to create?",
+        multiselect=True,
+        name_fn=lambda t: u"{}  —  {}".format(t[0], t[1]),
+        context=(u"Select which of the missing sheets to create now. Use 'Select all' "
+                 u"to create every missing sheet. Each new sheet clones the title block "
+                 u"and editable parameters from a reference sheet you'll pick next; "
+                 u"Sheet Number and Sheet Name come from the JSON.")
+    )
+    if not chosen:          # None (cancelled) or empty selection
+        return
+    to_create = list(chosen)
 
     # Pick reference sheet (lazy — called here, not at startup)
     ref_sheet = _pick_reference_sheet(doc, dest_prefix)

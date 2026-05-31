@@ -30,7 +30,7 @@ output.close()
 # HELPERS
 # ─────────────────────────────────────────────────────────────────────────────
 
-_SPF_PATH = _os.path.join(_ext_dir, 'lib', 'cucosync_shared_params.txt')
+_SPF_PATH = _os.path.join(_ext_dir, 'lib', 'common_details_shared_params.txt')
 
 
 def _patch_spf_varies(spf_path, param_name):
@@ -73,7 +73,7 @@ def ensure_detail_id_param(doc, app):
         spf = app.OpenSharedParameterFile()
         if spf is None:
             return False
-        grp = spf.Groups.get_Item("CucoSync") or spf.Groups.Create("CucoSync")
+        grp = spf.Groups.get_Item("Common Details") or spf.Groups.Create("Common Details")
         defn = grp.Definitions.get_Item("Detail ID")
         if defn is None:
             opts = DB.ExternalDefinitionCreationOptions("Detail ID", DB.SpecTypeId.String.Text)

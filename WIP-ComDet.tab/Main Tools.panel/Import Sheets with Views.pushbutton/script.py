@@ -27,7 +27,7 @@ output = script.get_output()
 output.close()
 
 NONE_OPTION = "None (I'm importing views into the Common Details file)"
-_SPF_PATH   = _os.path.join(_ext_dir, 'lib', 'cucosync_shared_params.txt')
+_SPF_PATH   = _os.path.join(_ext_dir, 'lib', 'common_details_shared_params.txt')
 
 # ─────────────────────────────────────────────────────────────────────────────
 # HELPERS
@@ -67,7 +67,7 @@ def ensure_detail_id_param(doc, app):
         spf = app.OpenSharedParameterFile()
         if spf is None:
             return False
-        grp = spf.Groups.get_Item("CucoSync") or spf.Groups.Create("CucoSync")
+        grp = spf.Groups.get_Item("Common Details") or spf.Groups.Create("Common Details")
         defn = grp.Definitions.get_Item("Detail ID")
         if defn is None:
             opts = DB.ExternalDefinitionCreationOptions("Detail ID", DB.SpecTypeId.String.Text)
@@ -238,6 +238,22 @@ if master_map_loaded:
     master_map_info = u"master_map.json: {} remapped ({})".format(remapped, map_dir)
 
 # ─────────────────────────────────────────────────────────────────────────────
+# 1c2. Destination model prefix (asked early so the sheet picker can be filtered)
+# ─────────────────────────────────────────────────────────────────────────────
+
+dest_prefix = ui.ask_for_string(
+    prompt="Enter the 2-letter prefix of the destination model\n(e.g. AE, AB, AC...)",
+    title="2 of 5 — Destination Model Prefix",
+    context=u"2-letter prefix used to rewrite the JSON's sheet names for this "
+            u"destination. Common building prefixes: AE, AB, AC, AD, AF, AG, AK; "
+            u"AS for Site. Use 'CD' when importing into Common Details itself."
+)
+if not dest_prefix:
+    script.exit()
+
+dest_prefix = dest_prefix.strip().upper()
+
+# ─────────────────────────────────────────────────────────────────────────────
 # 1d. Select which sheets to import
 #     The JSON's natural unit is the sheet — the user picks which sheets they
 #     want to bring across; the tool then derives the set of dependent views
@@ -255,6 +271,25 @@ if not sheets_in_json:
     )
     script.exit()
 
+# Filter JSON sheets to this building: keep only sheets whose source prefix
+# matches the destination prefix or the shared "AX" common-details prefix.
+# A multi-building export carries sheets for every building; without this the
+# picker would list (and could import) details from the wrong buildings.
+SHARED_PREFIX = u"AX"
+_full = len(sheets_in_json)
+sheets_in_json = [sh for sh in sheets_in_json
+                  if sh.get("sheet_number", u"")[:2].upper() in (dest_prefix, SHARED_PREFIX)]
+_skipped = _full - len(sheets_in_json)
+
+if not sheets_in_json:
+    ui.alert(
+        u"No sheets in the JSON match prefix '{}' or the shared '{}' prefix.\n\n"
+        u"The JSON has {} sheet(s) for other buildings. Re-run and enter the "
+        u"correct destination prefix.".format(dest_prefix, SHARED_PREFIX, _full),
+        title=u"Import Sheets with Views"
+    )
+    script.exit()
+
 sheet_options = [
     u"{} - {}  ({} views)".format(
         sh["sheet_number"], sh.get("sheet_name", ""),
@@ -263,12 +298,14 @@ sheet_options = [
 ]
 chosen_sheet_opts = ui.pick_list(
     sheet_options,
-    "2 of 5 — Select Sheets to Import",
+    "3 of 5 — Select Sheets to Import",
     multiselect=True,
-    context=u"Tick the sheets you want to bring into the active model. The tool "
-            u"figures out which dependent views each sheet needs and creates them "
-            u"automatically under their matching master views. Sheets you don't "
-            u"tick (and any views unique to them) are skipped entirely."
+    context=(u"Only sheets for prefix {} and shared AX are shown ({} from other "
+             u"buildings hidden). Tick the sheets you want to bring into the active "
+             u"model. The tool figures out which dependent views each sheet needs "
+             u"and creates them automatically under their matching master views. "
+             u"Sheets you don't tick (and any views unique to them) are skipped "
+             u"entirely.".format(dest_prefix, _skipped))
 )
 if not chosen_sheet_opts:
     script.exit()
@@ -317,7 +354,7 @@ strategy = ui.pick_list(
         "Skip existing — do not touch dependent views that already exist",
         "Update existing — re-apply crop boundary to views that already exist",
     ],
-    "3 of 5 — Strategy for Existing Dependent Views",
+    "4 of 5 — Strategy for Existing Dependent Views",
     button_name="Next",
     multiselect=False,
     context=u"If a dependent already exists: 'Skip' leaves it untouched. 'Update' "
@@ -343,7 +380,7 @@ sheet_options_list = [
 
 chosen_sheet_opts = ui.pick_list(
     sheet_options_list,
-    "4 of 5 — Sheet Update Options",
+    "5 of 5 — Sheet Update Options",
     button_name="Next",
     context=u"If the sheets already exist: pick what to overwrite (viewport position, "
             u"viewport type, detail number, title on sheet, detail lines). The 5 "
@@ -357,22 +394,6 @@ DO_VP_TYPE    = any("Match viewport types"      in o for o in chosen_sheet_opts)
 DO_DET_NUMBER = any("Detail number"             in o for o in chosen_sheet_opts)
 DO_TITLE      = any("Title on sheet"            in o for o in chosen_sheet_opts)
 DO_LINES      = any("Detail lines"              in o for o in chosen_sheet_opts)
-
-# ─────────────────────────────────────────────────────────────────────────────
-# 4. Destination model prefix
-# ─────────────────────────────────────────────────────────────────────────────
-
-dest_prefix = ui.ask_for_string(
-    prompt="Enter the 2-letter prefix of the destination model\n(e.g. AE, AB, AC...)",
-    title="5 of 5 — Destination Model Prefix",
-    context=u"2-letter prefix used to rewrite the JSON's sheet names for this "
-            u"destination. Common building prefixes: AE, AB, AC, AD, AF, AG, AK; "
-            u"AS for Site. Use 'CD' when importing into Common Details itself."
-)
-if not dest_prefix:
-    script.exit()
-
-dest_prefix = dest_prefix.strip().upper()
 
 # ─────────────────────────────────────────────────────────────────────────────
 # 5. Index destination model resources
@@ -1214,6 +1235,12 @@ with ui.ProgressBar(title=u"Import Sheets with Views", cancellable=True, step=5)
                                         entry.get("label_offset_y", 0), 0)
                                 except Exception:
                                     pass
+                                _lll = entry.get("label_line_length")
+                                if _lll is not None:
+                                    try:
+                                        existing_vp.LabelLineLength = _lll
+                                    except Exception:
+                                        pass
                             if DO_TITLE:
                                 title = entry.get("title_on_sheet", "")
                                 if title:
@@ -1267,6 +1294,12 @@ with ui.ProgressBar(title=u"Import Sheets with Views", cancellable=True, step=5)
                                             entry.get("label_offset_y", 0), 0)
                                     except Exception:
                                         pass
+                                    _lll = entry.get("label_line_length")
+                                    if _lll is not None:
+                                        try:
+                                            vp.LabelLineLength = _lll
+                                        except Exception:
+                                            pass
                                 title = entry.get("title_on_sheet", "")
                                 if DO_TITLE and title:
                                     try:
@@ -1314,6 +1347,12 @@ with ui.ProgressBar(title=u"Import Sheets with Views", cancellable=True, step=5)
                                     entry.get("label_offset_y", 0), 0)
                             except Exception:
                                 pass
+                            _lll = entry.get("label_line_length")
+                            if _lll is not None:
+                                try:
+                                    vp.LabelLineLength = _lll
+                                except Exception:
+                                    pass
                         title = entry.get("title_on_sheet", "")
                         if title:
                             try:
@@ -1435,9 +1474,15 @@ with ui.ProgressBar(title=u"Import Sheets with Views", cancellable=True, step=5)
         # and the title position to source's, so the content lines up with the
         # detail lines drawn at world coords on the sheet.
         #
-        # Anchor: label_max_x (title right edge) + box_min_y (box bottom).
-        # Fallback: box bottom-right, then box center (for old JSON without
-        # box/label outline data).
+        # Anchor: crop-box bottom-LEFT corner (box_min_x, box_min_y).
+        # Older versions anchored on label_max_x via GetLabelOutline().MaximumPoint.X.
+        # But when a viewport title has a LINE spanning the box width, the label
+        # outline returns the LINE's extent (not the text); since the box differs
+        # building-to-building, the X anchor drifts and scrambles the sheet
+        # (e.g. Non-Structural Framing Details). box_min_x is immune to the title
+        # line/text width, and for plain-text titles it yields the same delta as
+        # before (LabelOffset is copied in T1 and cancels).
+        # Fallback: box center (for old JSON without box outline data).
         if vp_id_to_target_center:
             t3 = DB.Transaction(doc, "Import Sheets with Views T3 - align {}".format(sheet_label))
             try:
@@ -1450,17 +1495,12 @@ with ui.ProgressBar(title=u"Import Sheets with Views", cancellable=True, step=5)
                     _src = vp_id_to_source_box.get(_vp_id_int)
                     # Determine alignment target
                     if _src and _src[1] is not None:
-                        # New JSON with box (+ optional label) outline data
-                        _src_label_max_x = _src[7] if len(_src) > 7 else None
-                        _tgt_x = _src_label_max_x if _src_label_max_x is not None else _src[3]
+                        # New JSON with box outline data — anchor on box bottom-left
+                        _tgt_x = _src[1]   # box_min_x
                         _tgt_y = _src[2]   # box_min_y
                         try:
                             _d_box = _vp.GetBoxOutline()
-                            try:
-                                _d_lbl = _vp.GetLabelOutline()
-                                _cur_x = _d_lbl.MaximumPoint.X
-                            except Exception:
-                                _cur_x = _d_box.MaximumPoint.X
+                            _cur_x = _d_box.MinimumPoint.X
                             _cur_y = _d_box.MinimumPoint.Y
                         except Exception:
                             continue

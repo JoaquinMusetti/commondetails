@@ -1,5 +1,5 @@
 # -*- coding: utf-8 -*-
-__title__ = 'Audit\nSource Views'
+__title__ = 'New\nDetails'
 __doc__ = ('Compares a Sheets with Views JSON against the current model. '
            'Reports views in JSON no longer in the model, new views not yet '
            'exported, and detects possible renames by matching Title on Sheet. '

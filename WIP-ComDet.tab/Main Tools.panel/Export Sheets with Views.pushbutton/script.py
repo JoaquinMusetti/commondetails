@@ -348,6 +348,12 @@ with ui.ProgressBar(title=u"Building sheet layout", cancellable=False, step=1) a
             label_y = vp.LabelOffset.Y
         except Exception:
             label_x = label_y = 0
+        # Title-line length — SIGNED: negative = line points LEFT, positive = RIGHT.
+        # (Revit 2022+; one value carries both length and direction.)
+        try:
+            label_line_length = vp.LabelLineLength
+        except Exception:
+            label_line_length = None
         title_on_sheet = ""
         try:
             p = v.get_Parameter(DB.BuiltInParameter.VIEW_DESCRIPTION)
@@ -369,6 +375,7 @@ with ui.ProgressBar(title=u"Building sheet layout", cancellable=False, step=1) a
             "viewport_center_y": center.Y,
             "label_offset_x":    label_x,
             "label_offset_y":    label_y,
+            "label_line_length": label_line_length,
             "viewport_type":     get_viewport_type_name(vp),
             "view_scale":        v.Scale,
             "view_template":     template_name,

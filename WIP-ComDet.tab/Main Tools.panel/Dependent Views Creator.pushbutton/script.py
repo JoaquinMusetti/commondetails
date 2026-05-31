@@ -207,7 +207,7 @@ def make_crop_loop(bbox_viewspace, view_transform):
 _SPF_PATH = _os.path.join(
     _os.path.dirname(_os.path.dirname(_os.path.dirname(_os.path.dirname(
         _os.path.abspath(__file__))))),
-    'lib', 'cucosync_shared_params.txt')
+    'lib', 'common_details_shared_params.txt')
 
 
 def _patch_spf_varies(spf_path, param_name):
@@ -243,7 +243,7 @@ def _ensure_detail_id_param(doc, app):
         spf = app.OpenSharedParameterFile()
         if spf is None:
             return False
-        grp = spf.Groups.get_Item("CucoSync") or spf.Groups.Create("CucoSync")
+        grp = spf.Groups.get_Item("Common Details") or spf.Groups.Create("Common Details")
         defn = grp.Definitions.get_Item("Detail ID")
         if defn is None:
             opts = DB.ExternalDefinitionCreationOptions("Detail ID", DB.SpecTypeId.String.Text)

@@ -1,5 +1,5 @@
 # -*- coding: utf-8 -*-
-__title__ = "Audit\nLine Density"
+__title__ = "Scan\nLine Density"
 __doc__ = (
     "Scans the active view for zones with high concentrations of detail curves. "
     "Clusters adjacent hot cells and shows a ranked list - double-click any row "
