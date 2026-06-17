@@ -1,20 +1,26 @@
 # -*- coding: utf-8 -*-
 __title__ = 'Updates\nReport'
 __doc__ = ('Compares two Sheets with Views JSON snapshots (previous vs. '
-           'current) exported from the source model and builds a change '
-           'report for the Production Team (Teams-ready, copy & paste).\n\n'
-           'Detects:\n'
-           '  - Views added / removed per sheet\n'
-           '  - Views moved between sheets\n'
-           '  - Views no longer used anywhere\n'
-           '  - View type changes (e.g. Section -> FloorPlan)\n'
-           '  - Detail number changes on views that stayed on the same sheet')
+           'current) exported from the source model and builds a per-sheet '
+           'change report for the Production Team (Teams-ready + PDF).\n\n'
+           'Per sheet, classifies every view into five buckets:\n'
+           '  - Added (new on the sheet / moved in from another)\n'
+           '  - Removed or relocated (gone / moved out)\n'
+           '  - Renamed (same Detail ID, different name)\n'
+           '  - Renumber (same view, different detail number)\n'
+           '  - Unchanged\n'
+           'Renames are detected by Detail ID (carried in the JSON), so a '
+           'renamed view is NOT reported as a remove+add. Sheets are matched '
+           'by number suffix so the report survives a prefix migration '
+           '(e.g. AA10.## -> AX10.##). Building-specific custom sheets '
+           '(prefix != AX) get their own section.')
 
 import sys
 import json
 import os
 import re
 from datetime import datetime
+from collections import OrderedDict
 from pyrevit import script, forms
 
 sys.path.append(os.path.join(
@@ -33,6 +39,8 @@ from System.Collections.ObjectModel import ObservableCollection
 
 output = script.get_output()
 output.close()
+
+COMMON_PREFIX = u"AX"
 
 # ─────────────────────────────────────────────────────────────────────────────
 # Row class — PascalCase properties for WPF binding
@@ -126,172 +134,292 @@ prev_date   = _extract_date(prev_path)
 curr_date   = _extract_date(curr_path)
 
 # ─────────────────────────────────────────────────────────────────────────────
-# 2. Index both snapshots
+# 2. Detail-ID maps (name -> id), per snapshot
+#    Sheet viewports don't carry detail_id, but master_views.dependent_views do.
+#    Build a name->id map per snapshot so views can be matched across snapshots
+#    by IDENTITY (id when present, else name). A renamed view keeps its id, so
+#    it still matches — that's how a rename is told apart from a remove+add.
 # ─────────────────────────────────────────────────────────────────────────────
 
-def build_index(layout):
-    sheets   = {}
-    view_loc = {}
+def build_name2id(d):
+    # Only IDs that map to a SINGLE name are usable as identity. A detail_id
+    # shared by several distinct views (data error / legacy dupes) is ambiguous —
+    # drop it so those views fall back to name matching instead of collapsing
+    # into one identity and producing phantom renames.
+    id2names = {}
+    for mv in d.get("master_views", []):
+        for dep in mv.get("dependent_views", []):
+            nm  = dep.get("view_name", u"")
+            did = dep.get("detail_id", u"")
+            if nm and did:
+                id2names.setdefault(did, set()).add(nm)
+    m = {}
+    for did, names in id2names.items():
+        if len(names) == 1:
+            m[list(names)[0]] = did
+    return m
+
+
+prev_name2id = build_name2id(prev_data)
+curr_name2id = build_name2id(curr_data)
+
+
+def _ident_prev(name):
+    return prev_name2id.get(name) or (u"name::" + name)
+
+
+def _ident_curr(name):
+    return curr_name2id.get(name) or (u"name::" + name)
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# 3. Index both snapshots — sheets keyed by NUMBER SUFFIX (survives prefix swap)
+# ─────────────────────────────────────────────────────────────────────────────
+
+def _suf(s):
+    return s[2:] if len(s) > 2 else s
+
+
+def _pfx(s):
+    return s[:2].upper() if s else u"??"
+
+
+def sheet_views(s):
+    out = OrderedDict()
+    for vp in s.get("viewports", []):
+        n = vp.get("view_name", u"")
+        if not n:
+            continue
+        out[n] = {"det": vp.get("detail_number", u""),
+                  "vt":  vp.get("view_type", u"")}
+    return out
+
+
+def _index(layout):
+    """Split a layout into common (AX, keyed by suffix) and custom (non-AX,
+    keyed by full number) sheets."""
+    common = OrderedDict()
+    cust   = OrderedDict()
     for s in layout:
-        sn   = s["sheet_number"]
-        name = s.get("sheet_name", u"")
-        views = {}
-        for vp in s.get("viewports", []):
-            vname = vp.get("view_name", u"")
-            if not vname:
-                continue
-            views[vname] = {
-                "detail_number": vp.get("detail_number", u""),
-                "view_type":     vp.get("view_type", u""),
-                "viewport_type": vp.get("viewport_type", u""),
-            }
-            view_loc.setdefault(vname, []).append(sn)
-        sheets[sn] = {"sheet_name": name, "views": views}
-    return sheets, view_loc
-
-
-prev_sheets, prev_view_loc = build_index(prev_layout)
-curr_sheets, curr_view_loc = build_index(curr_layout)
-
-# ─────────────────────────────────────────────────────────────────────────────
-# 3. Compute per-sheet diffs
-# ─────────────────────────────────────────────────────────────────────────────
-
-all_sheet_numbers = sorted(set(list(prev_sheets.keys()) + list(curr_sheets.keys())))
-
-sheet_reports         = []
-sheets_new            = []
-sheets_removed        = []
-removed_view_to_sheet = {}
-added_view_to_sheet   = {}
-
-for sn in all_sheet_numbers:
-    prev_sheet = prev_sheets.get(sn)
-    curr_sheet = curr_sheets.get(sn)
-
-    if prev_sheet is None and curr_sheet is not None:
-        sheets_new.append(sn)
-        for vname in curr_sheet["views"].keys():
-            added_view_to_sheet.setdefault(vname, []).append(sn)
-        continue
-    if curr_sheet is None and prev_sheet is not None:
-        sheets_removed.append(sn)
-        for vname in prev_sheet["views"].keys():
-            removed_view_to_sheet.setdefault(vname, []).append(sn)
-        continue
-
-    prev_views = set(prev_sheet["views"].keys())
-    curr_views = set(curr_sheet["views"].keys())
-
-    added   = sorted(curr_views - prev_views)
-    removed = sorted(prev_views - curr_views)
-    stayed  = curr_views & prev_views
-
-    for vname in added:
-        added_view_to_sheet.setdefault(vname, []).append(sn)
-    for vname in removed:
-        removed_view_to_sheet.setdefault(vname, []).append(sn)
-
-    view_type_changes = []
-    detail_changes    = []
-    for vname in sorted(stayed):
-        p = prev_sheet["views"][vname]
-        c = curr_sheet["views"][vname]
-        if (p.get("view_type", u"") != c.get("view_type", u"")
-                and p.get("view_type") and c.get("view_type")):
-            view_type_changes.append((vname, p["view_type"], c["view_type"]))
-        if p.get("detail_number", u"") != c.get("detail_number", u""):
-            detail_changes.append(
-                (vname, p.get("detail_number", u""), c.get("detail_number", u"")))
-
-    has_changes = bool(added or removed or view_type_changes or detail_changes) or \
-                  prev_sheet["sheet_name"] != curr_sheet["sheet_name"]
-
-    sheet_reports.append({
-        "sheet_number":      sn,
-        "prev_name":         prev_sheet["sheet_name"],
-        "curr_name":         curr_sheet["sheet_name"],
-        "added":             added,
-        "removed":           removed,
-        "view_type_changes": view_type_changes,
-        "detail_changes":    detail_changes,
-        "changed":           has_changes,
-    })
-
-# Resolve moves
-moves = []
-moved_view_names = set()
-for vname, removed_from in removed_view_to_sheet.items():
-    if vname in added_view_to_sheet:
-        added_to = added_view_to_sheet[vname]
-        for i, rs in enumerate(removed_from):
-            if i < len(added_to):
-                moves.append((vname, rs, added_to[i]))
-                moved_view_names.add(vname)
-
-views_removed_entirely = sorted(
-    [v for v in prev_view_loc.keys() if v not in curr_view_loc])
-views_added_entirely   = sorted(
-    [v for v in curr_view_loc.keys() if v not in prev_view_loc])
-
-move_pairs = {}
-for vname, frm, to in moves:
-    move_pairs.setdefault((frm, to), []).append(vname)
-
-
-def is_moved_in(vname, sheet_number):
-    for mv, frm, to in moves:
-        if mv == vname and to == sheet_number:
-            return frm
-    return None
-
-
-def is_moved_out(vname, sheet_number):
-    for mv, frm, to in moves:
-        if mv == vname and frm == sheet_number:
-            return to
-    return None
-
-
-for r in sheet_reports:
-    sn = r["sheet_number"]
-    real_added   = []
-    real_removed = []
-    moves_in     = {}
-    moves_out    = {}
-    for v in r["added"]:
-        src = is_moved_in(v, sn)
-        if src:
-            moves_in.setdefault(src, []).append(v)
+        sn  = s["sheet_number"]
+        rec = {"number": sn, "prefix": _pfx(sn),
+               "name": s.get("sheet_name", u""), "views": sheet_views(s)}
+        if _pfx(sn) == COMMON_PREFIX:
+            common[_suf(sn)] = rec
         else:
-            real_added.append(v)
-    for v in r["removed"]:
-        dst = is_moved_out(v, sn)
-        if dst:
-            moves_out.setdefault(dst, []).append(v)
-        else:
-            real_removed.append(v)
-    r["real_added"]   = real_added
-    r["real_removed"] = real_removed
-    r["moves_in"]     = moves_in
-    r["moves_out"]    = moves_out
-    r["renumbering_only"] = (
-        not real_added and not real_removed
-        and not moves_in and not moves_out
-        and not r["view_type_changes"]
-        and r["prev_name"] == r["curr_name"]
-        and bool(r["detail_changes"])
-    )
-    r["detail_noise"] = bool(
-        moves_in or moves_out or real_added or real_removed) and bool(r["detail_changes"])
+            cust[sn] = rec
+    return common, cust
 
-changed_sheets    = [r for r in sheet_reports if r["changed"]]
-unchanged_sheets  = [r for r in sheet_reports if not r["changed"]]
-substantive_sheets = [r for r in changed_sheets if not r["renumbering_only"]]
-renumbering_sheets = [r for r in changed_sheets if r["renumbering_only"]]
+
+prev_common, prev_custom = _index(prev_layout)
+curr_common, curr_custom = _index(curr_layout)
+
+# Global identity -> [sheet numbers] and identity -> name, over ALL sheets
+# (common + custom) of each snapshot — so moves between common and custom
+# sheets are detected, and retired/new-genuine tallies are complete.
+old_id_loc  = {}
+old_id_name = {}
+for sh in list(prev_common.values()) + list(prev_custom.values()):
+    for nm in sh["views"]:
+        idn = _ident_prev(nm)
+        old_id_loc.setdefault(idn, []).append(sh["number"])
+        old_id_name.setdefault(idn, nm)
+
+new_id_loc  = {}
+new_id_name = {}
+for sh in list(curr_common.values()) + list(curr_custom.values()):
+    for nm in sh["views"]:
+        idn = _ident_curr(nm)
+        new_id_loc.setdefault(idn, []).append(sh["number"])
+        new_id_name.setdefault(idn, nm)
+
+
+def _first_other(locs, this):
+    o = [x for x in locs if x != this]
+    return o[0] if o else (locs[0] if locs else None)
+
 
 # ─────────────────────────────────────────────────────────────────────────────
-# 4. Build per-sheet change data for inline XAML generation
+# 4. Per-sheet classification → 5 buckets
+# ─────────────────────────────────────────────────────────────────────────────
+
+def classify(old_views, new_views, this_number):
+    added, removed, renamed, renumber, unchanged = [], [], [], [], []
+    old_by_ident = {}      # identity -> (name, meta)
+    for o, m in old_views.items():
+        old_by_ident[_ident_prev(o)] = (o, m)
+    new_idents = set(_ident_curr(n) for n in new_views)
+
+    for n, mn in new_views.items():
+        idn = _ident_curr(n)
+        if idn in old_by_ident:
+            o, mo = old_by_ident[idn]
+            note = u""
+            if mo["det"] != mn["det"]:
+                note = u"  (det# {} → {})".format(mo["det"] or u"–",
+                                                       mn["det"] or u"–")
+            if o != n:
+                renamed.append(u"{} → {}{}".format(o, n, note))
+            else:
+                if mo["det"] != mn["det"]:
+                    renumber.append(u"{}: {} → {}".format(
+                        n, mo["det"] or u"–", mn["det"] or u"–"))
+                elif mo["vt"] and mn["vt"] and mo["vt"] != mn["vt"]:
+                    unchanged.append(u"{}  (type {} → {})".format(n, mo["vt"], mn["vt"]))
+                else:
+                    unchanged.append(n)
+        else:
+            if idn in old_id_loc:                  # identity exists on another old sheet
+                src = _first_other(old_id_loc.get(idn, []), this_number)
+                o = old_id_name.get(idn, n)
+                if o != n:
+                    renamed.append(u"{} → {}{}".format(
+                        o, n, u"  (from {})".format(src) if src else u""))
+                else:
+                    added.append(u"{}{}".format(
+                        n, u"  (moved from {})".format(src) if src else u""))
+            else:
+                added.append(n)
+
+    for o, mo in old_views.items():
+        ido = _ident_prev(o)
+        if ido in new_idents:
+            continue                               # handled above
+        if ido in new_id_loc:                      # exists elsewhere now
+            dst = _first_other(new_id_loc.get(ido, []), this_number)
+            new_nm = new_id_name.get(ido, o)
+            if new_nm != o:
+                pass                               # shown as renamed on destination sheet
+            else:
+                removed.append(u"{}  (moved to {})".format(o, dst) if dst else o)
+        else:
+            removed.append(o)
+
+    return added, removed, renamed, renumber, unchanged
+
+
+def _diff_pairs(prev_map, curr_map, keys):
+    """Run classify over a set of keys; return (changed_blocks, unchanged_list)."""
+    blocks = []
+    unchanged = []
+    for k in keys:
+        p = prev_map.get(k)
+        c = curr_map.get(k)
+        ov = p["views"] if p else OrderedDict()
+        nv = c["views"] if c else OrderedDict()
+        number = (c or p)["number"]
+        name   = (c or p)["name"]
+        a, r, rn, rnum, un = classify(ov, nv, number)
+        blk = {"number": number, "name": name, "prefix": (c or p)["prefix"],
+               "added": a, "removed": r, "renamed": rn, "renumber": rnum,
+               "unchanged": un, "is_new": (p is None), "is_removed": (c is None)}
+        if a or r or rn or rnum:
+            blocks.append(blk)
+        else:
+            unchanged.append((number, name, len(un)))
+    blocks.sort(key=lambda b: b["number"])
+    return blocks, unchanged
+
+
+# Common (AX) sheets — matched by number suffix
+sheet_blocks, common_unchanged = _diff_pairs(
+    prev_common, curr_common,
+    sorted(set(list(prev_common.keys()) + list(curr_common.keys()))))
+
+# Custom (building-specific) sheets — matched by full number
+custom_blocks, custom_unchanged = _diff_pairs(
+    prev_custom, curr_custom,
+    sorted(set(list(prev_custom.keys()) + list(curr_custom.keys()))))
+
+unchanged_only = sorted(common_unchanged + custom_unchanged)
+
+# Global tallies
+all_old_idents = set(old_id_loc.keys())
+all_new_idents = set(new_id_loc.keys())
+retired     = sorted(old_id_name[i] for i in (all_old_idents - all_new_idents))
+new_genuine = sorted(new_id_name[i] for i in (all_new_idents - all_old_idents))
+tot_renum   = sum(len(b["renumber"]) for b in sheet_blocks + custom_blocks)
+n_ren       = sum(len(b["renamed"])  for b in sheet_blocks + custom_blocks)
+
+new_common = [b for b in sheet_blocks if b["is_new"]]
+rem_common = [b for b in sheet_blocks if b["is_removed"]]
+chg_common = [b for b in sheet_blocks if not b["is_new"] and not b["is_removed"]]
+
+# Summary headline bits
+summ = []
+if new_common:    summ.append(u"{} new common sheet(s)".format(len(new_common)))
+if rem_common:    summ.append(u"{} removed common sheet(s)".format(len(rem_common)))
+if chg_common:    summ.append(u"{} common sheet(s) changed".format(len(chg_common)))
+if custom_blocks: summ.append(u"{} custom sheet(s)".format(len(custom_blocks)))
+if n_ren:         summ.append(u"{} renamed".format(n_ren))
+if tot_renum:     summ.append(u"{} renumbered".format(tot_renum))
+if retired:       summ.append(u"{} retired".format(len(retired)))
+if not summ:      summ.append(u"no changes")
+headline_bits = summ
+
+subtitle = u"Previous: {}  ·  Current: {}  ·  {} unchanged".format(
+    prev_date, curr_date, len(unchanged_only))
+
+# ─────────────────────────────────────────────────────────────────────────────
+# 5. Teams-ready plain text (for clipboard)
+# ─────────────────────────────────────────────────────────────────────────────
+
+T = []
+ad = T.append
+ad(u"Detail Sheets Update Report — {}".format(TODAY_LABEL))
+ad(u"Previous: {}  •  Current: {}".format(prev_date, curr_date))
+ad(u"")
+ad(u"Summary: " + u"  •  ".join(summ))
+ad(u"")
+
+
+def _teams_sheet(b):
+    ad(u"[{}] {}".format(b["number"], b["name"]))
+    for v in b["renamed"]:  ad(u"   ✏ rename : {}".format(v))
+    for v in b["added"]:    ad(u"   ➕ added  : {}".format(v))
+    for v in b["removed"]:  ad(u"   ➖ removed: {}".format(v))
+    for v in b["renumber"]: ad(u"   \U0001f522 renum  : {}".format(v))
+
+
+if new_common:
+    ad(u"\U0001f195 NEW COMMON SHEETS")
+    for b in new_common:
+        _teams_sheet(b)
+    ad(u"")
+if chg_common:
+    ad(u"✳ CHANGED COMMON SHEETS")
+    for b in chg_common:
+        _teams_sheet(b)
+    ad(u"")
+if rem_common:
+    ad(u"\U0001f5d1 REMOVED COMMON SHEETS")
+    for b in rem_common:
+        _teams_sheet(b)
+    ad(u"")
+if custom_blocks:
+    ad(u"\U0001f3d7 CUSTOM SHEETS (building-specific)")
+    byp = OrderedDict()
+    for b in sorted(custom_blocks, key=lambda x: x["number"]):
+        byp.setdefault(b["prefix"], []).append(b)
+    for pf in sorted(byp):
+        ad(u"  Building {}".format(pf))
+        for b in byp[pf]:
+            _teams_sheet(b)
+    ad(u"")
+if retired:
+    ad(u"\U0001f9f9 VIEWS NO LONGER USED ANYWHERE ({})".format(len(retired)))
+    for v in retired:
+        ad(u"- {}".format(v))
+    ad(u"")
+if unchanged_only:
+    ad(u"✓ UNCHANGED SHEETS ({})".format(len(unchanged_only)))
+    for num, name, cnt in unchanged_only:
+        ad(u"- {} — {} ({} views)".format(num, name, cnt))
+
+teams_plain = u"\r\n".join(T).rstrip()
+
+# ─────────────────────────────────────────────────────────────────────────────
+# 6. WPF preview data — per-sheet expanders (content baked into XAML)
 # ─────────────────────────────────────────────────────────────────────────────
 
 def _xesc(text):
@@ -305,207 +433,215 @@ def _xesc(text):
             .replace(u'"', u"&quot;"))
 
 
-# sheet_change_data  — structural changes (adds, removes, moves, type changes, renames)
-# renum_change_data  — renumbering-only sheets (detail number changes, cosmetic)
-# Each entry: (sheet_number, curr_name, changes_list, badges_list)
-#   changes_list: [(icon, view_name, detail_text, fg_color), ...]
-#   badges_list:  [(label, fg, bg, border), ...]
-
+# changes_list: [(icon, view_name, detail_text, fg_color), ...]
+# badges_list:  [(label, fg, bg, border), ...]
 sheet_change_data = []
 renum_change_data = []
 
-for r in [r for r in sheet_reports if r["changed"]]:
-    sn        = r["sheet_number"]
-    curr_name = r["curr_name"]
-    changes   = []
-
-    # Sheet rename
-    if r["prev_name"] != r["curr_name"]:
-        changes.append((u"✏", u"Sheet renamed",
-                        u"{} → {}".format(r["prev_name"], r["curr_name"]),
-                        u"#9099C8"))
-
-    # Views moved in from another sheet
-    for src in sorted(r["moves_in"].keys()):
-        for v in sorted(r["moves_in"][src]):
-            changes.append((u"↔", v,
-                            u"moved in from {}".format(src),
-                            u"#5B8EC4"))
-
-    # Views moved out to another sheet
-    for dst in sorted(r["moves_out"].keys()):
-        for v in sorted(r["moves_out"][dst]):
-            changes.append((u"↔", v,
-                            u"moved out to {}".format(dst),
-                            u"#7EB4F0"))
-
-    # Real adds and removes
-    for v in r["real_added"]:
+for b in sheet_blocks + custom_blocks:
+    changes = []
+    for v in b["renamed"]:
+        changes.append((u"✏", v, u"renamed", u"#9099C8"))
+    for v in b["added"]:
         changes.append((u"➕", v, u"added", u"#50E898"))
-    for v in r["real_removed"]:
+    for v in b["removed"]:
         changes.append((u"➖", v, u"removed", u"#FF7070"))
-
-    # View type changes
-    for vname, old_t, new_t in r["view_type_changes"]:
-        changes.append((u"🔄", vname,
-                        u"{} → {}".format(old_t, new_t),
-                        u"#E87E20"))
-
-    # Detail number changes (shown only for renumbering-only sheets)
-    if r["renumbering_only"]:
-        for vname, old_det, new_det in r["detail_changes"]:
-            changes.append((u"🔢", vname,
-                            u"det# {} → {}".format(old_det, new_det),
-                            u"#5B8EC4"))
-
-    # Build header badges
-    n_added   = len(r["real_added"])
-    n_removed = len(r["real_removed"])
-    n_moves   = (sum(len(v) for v in r["moves_in"].values()) +
-                 sum(len(v) for v in r["moves_out"].values()))
-    n_type    = len(r["view_type_changes"])
-    n_renum   = len(r["detail_changes"]) if r["renumbering_only"] else 0
-    renamed   = r["prev_name"] != r["curr_name"]
+    for v in b["renumber"]:
+        changes.append((u"\U0001f522", v, u"renumber", u"#5B8EC4"))
 
     badges = []
-    if renamed:
-        badges.append((u"✏ renamed", u"#9099C8", u"#1A1D30", u"#9099C8"))
-    if n_added:
-        badges.append((u"+{}".format(n_added),  u"#50E898", u"#122E1C", u"#50E898"))
-    if n_removed:
-        badges.append((u"−{}".format(n_removed), u"#FF7070", u"#3C1212", u"#FF7070"))
-    if n_moves:
-        badges.append((u"↔ {}".format(n_moves),  u"#5B8EC4", u"#1A2535", u"#5B8EC4"))
-    if n_type:
-        badges.append((u"🔄 {}".format(n_type),  u"#E87E20", u"#2A1C0E", u"#E87E20"))
-    if n_renum:
-        badges.append((u"🔢 {}".format(n_renum), u"#5B8EC4", u"#1A2535", u"#5B8EC4"))
+    if b["is_new"]:
+        badges.append((u"NEW SHEET", u"#50E898", u"#122E1C", u"#50E898"))
+    if b["is_removed"]:
+        badges.append((u"REMOVED", u"#FF7070", u"#3C1212", u"#FF7070"))
+    if b["renamed"]:
+        badges.append((u"✏ {}".format(len(b["renamed"])), u"#9099C8", u"#1A1D30", u"#9099C8"))
+    if b["added"]:
+        badges.append((u"+{}".format(len(b["added"])),  u"#50E898", u"#122E1C", u"#50E898"))
+    if b["removed"]:
+        badges.append((u"−{}".format(len(b["removed"])), u"#FF7070", u"#3C1212", u"#FF7070"))
+    if b["renumber"]:
+        badges.append((u"\U0001f522 {}".format(len(b["renumber"])), u"#5B8EC4", u"#1A2535", u"#5B8EC4"))
 
-    target = renum_change_data if r["renumbering_only"] else sheet_change_data
-    target.append((sn, curr_name, changes, badges))
+    is_renum_only = bool(b["renumber"]) and not (b["added"] or b["removed"] or b["renamed"])
+    target = renum_change_data if is_renum_only else sheet_change_data
+    target.append((b["number"], b["name"], changes, badges))
 
-# Static section OCs — global data that isn't per-sheet
+# Static section OCs — new/removed sheets are already shown as per-sheet blocks
+# above (with NEW SHEET / REMOVED badges), so those two OCs stay empty to avoid
+# double-listing. New-views and retired-views keep their own sections.
 new_sheets_oc = ObservableCollection[object]()
 rem_sheets_oc = ObservableCollection[object]()
 new_views_oc  = ObservableCollection[object]()
 gone_views_oc = ObservableCollection[object]()
 
-for sn in sheets_new:
-    new_sheets_oc.Add(_Row(u"🆕", sn, curr_sheets[sn]["sheet_name"]))
-for sn in sheets_removed:
-    rem_sheets_oc.Add(_Row(u"🗑", sn, prev_sheets[sn]["sheet_name"]))
-for v in views_added_entirely:
+for v in new_genuine:
     new_views_oc.Add(_Row(u"✨", v))
-for v in views_removed_entirely:
-    gone_views_oc.Add(_Row(u"🧹", v))
+for v in retired:
+    gone_views_oc.Add(_Row(u"\U0001f9f9", v))
 
 # ─────────────────────────────────────────────────────────────────────────────
-# 5. Build Teams-ready text (for clipboard)
+# 7. HTML report builder (Export PDF button) — 5-column matrix per sheet
 # ─────────────────────────────────────────────────────────────────────────────
 
-headline_bits = []
-if sheets_new:             headline_bits.append(u"{} new sheet(s)".format(len(sheets_new)))
-if sheets_removed:         headline_bits.append(u"{} removed".format(len(sheets_removed)))
-if substantive_sheets:     headline_bits.append(u"{} sheet(s) with content changes".format(len(substantive_sheets)))
-if views_added_entirely:   headline_bits.append(u"{} new view(s) placed".format(len(views_added_entirely)))
-if moves:                  headline_bits.append(u"{} view(s) moved".format(len(moves)))
-if views_removed_entirely: headline_bits.append(u"{} view(s) no longer used".format(len(views_removed_entirely)))
-if renumbering_sheets:     headline_bits.append(u"{} sheet(s) with detail renumbering only".format(len(renumbering_sheets)))
-if not headline_bits:      headline_bits.append(u"no changes")
+def _esc(text):
+    if text is None:
+        return u""
+    return (unicode(text)
+            .replace(u"&", u"&amp;")
+            .replace(u"<", u"&lt;")
+            .replace(u">", u"&gt;"))
 
-teams_lines = []
-teams_lines.append(u"**Detail Sheets Update Report — {}**".format(TODAY_LABEL))
-teams_lines.append(u"_Previous: {}  •  Current: {}_".format(prev_date, curr_date))
-teams_lines.append(u"")
-teams_lines.append(u"**Summary:** {}".format(u"  •  ".join(headline_bits)))
-teams_lines.append(u"")
 
-if sheets_new:
-    teams_lines.append(u"**🆕 New sheets**")
-    for sn in sheets_new:
-        teams_lines.append(u"- {} — {}".format(sn, curr_sheets[sn]["sheet_name"]))
-    teams_lines.append(u"")
+CASES = [("added",     u"➕ Added",                u"#1E9E5A", u"#F0FBF4"),
+         ("removed",   u"➖ Removed or relocated", u"#D24343", u"#FDF2F2"),
+         ("renamed",   u"✏ Renamed",              u"#7A3FD0", u"#F7F3FD"),
+         ("renumber",  u"\U0001f522 Renumber",         u"#1F6FB0", u"#EEF6FC"),
+         ("unchanged", u"✓ Unchanged",            u"#7A8090", u"#F6F7F9")]
 
-if sheets_removed:
-    teams_lines.append(u"**🗑️ Removed sheets**")
-    for sn in sheets_removed:
-        teams_lines.append(u"- {} — {}".format(sn, prev_sheets[sn]["sheet_name"]))
-    teams_lines.append(u"")
 
-if move_pairs:
-    teams_lines.append(u"**↔️ Moves ({} views across {} sheet pair{})**".format(
-        len(moves), len(move_pairs), u"" if len(move_pairs) == 1 else u"s"))
-    for (frm, to), vs in sorted(move_pairs.items(), key=lambda kv: (-len(kv[1]), kv[0])):
-        teams_lines.append(u"- **{} → {}** ({} view{})".format(
-            frm, to, len(vs), u"" if len(vs) == 1 else u"s"))
-        for v in sorted(vs):
-            teams_lines.append(u"    - {}".format(v))
-    teams_lines.append(u"")
+def build_html_report():
+    """Landscape HTML; open in browser and Ctrl+P -> Save as PDF."""
 
-renames   = [(r["sheet_number"], r["prev_name"], r["curr_name"])
-             for r in substantive_sheets if r["prev_name"] != r["curr_name"]]
-real_adds = [(r["sheet_number"], r["curr_name"], r["real_added"])
-             for r in substantive_sheets if r["real_added"]]
-real_rems = [(r["sheet_number"], r["curr_name"], r["real_removed"])
-             for r in substantive_sheets if r["real_removed"]]
-vtc_all   = [(r["sheet_number"], vtc) for r in substantive_sheets
-             for vtc in r["view_type_changes"]]
+    def col_cell(label, fg, bg, items):
+        head = (u'<div style="font-weight:700;color:{fg};font-size:8.5px;'
+                u'border-bottom:1.5px solid {fg};padding:2px 4px;margin-bottom:2px">'
+                u'{lbl}&nbsp;({n})</div>').format(fg=fg, lbl=_esc(label), n=len(items))
+        body = u""
+        for it in items:
+            body += (u'<div style="font-size:8px;color:#222;padding:1px 4px;'
+                     u'border-bottom:1px solid #EEE;line-height:1.25">{}</div>').format(_esc(it))
+        if not items:
+            body = u'<div style="font-size:8px;color:#BBB;padding:1px 4px">&mdash;</div>'
+        return (u'<td valign="top" style="background:{bg};border:1px solid #E3E3EA;'
+                u'vertical-align:top;width:20%">{h}{b}</td>').format(bg=bg, h=head, b=body)
 
-if renames or real_adds or real_rems or vtc_all:
-    teams_lines.append(u"**➕➖ Content changes**")
-    for sn, old, new in renames:
-        teams_lines.append(u"- {}: sheet renamed  {} → {}".format(sn, old, new))
-    for sn, name, vs in real_adds:
-        teams_lines.append(u"- {} ({}) — added:".format(sn, name))
-        for v in vs:
-            teams_lines.append(u"    + {}".format(v))
-    for sn, name, vs in real_rems:
-        teams_lines.append(u"- {} ({}) — removed:".format(sn, name))
-        for v in vs:
-            teams_lines.append(u"    − {}".format(v))
-    for sn, (vname, old, new) in vtc_all:
-        teams_lines.append(u"- {}: view type changed — {} ({} → {})".format(
-            sn, vname, old, new))
-    teams_lines.append(u"")
+    def sheet_table(b):
+        tag = u""
+        if b["is_new"]:
+            tag = (u'<span style="background:#122E1C;color:#fff;font-size:8px;'
+                   u'padding:1px 6px;border-radius:3px;margin-left:8px">NEW SHEET</span>')
+        elif b["is_removed"]:
+            tag = (u'<span style="background:#3C1212;color:#fff;font-size:8px;'
+                   u'padding:1px 6px;border-radius:3px;margin-left:8px">REMOVED SHEET</span>')
+        counts = []
+        for key, label, fg, _bg in CASES:
+            if b[key]:
+                short = label.split(u" ", 1)[1] if u" " in label else label
+                counts.append(u'<span style="color:{};font-size:9px;margin-right:8px">'
+                              u'{}: {}</span>'.format(fg, short, len(b[key])))
+        hdr = (u'<div style="font-weight:700;font-size:11px;color:#1E2235;margin:2px 0">'
+               u'{num} <span style="color:#555;font-weight:400">&mdash; {name}</span>{tag}</div>'
+               u'<div style="margin-bottom:2px">{cnt}</div>').format(
+                   num=_esc(b["number"]), name=_esc(b["name"]), tag=tag, cnt=u"".join(counts))
+        cells = u"".join(col_cell(l, fg, bg, b[k]) for k, l, fg, bg in CASES)
+        return (u'<div style="page-break-inside:avoid;margin:0 0 10px;padding:6px 8px;'
+                u'border-left:3px solid #9013FE;background:#FCFCFE">'
+                u'{hdr}<table style="border-collapse:collapse;width:100%;table-layout:fixed">'
+                u'<tr>{cells}</tr></table></div>').format(hdr=hdr, cells=cells)
 
-if views_added_entirely:
-    teams_lines.append(u"**✨ New views placed**")
-    for v in views_added_entirely:
-        teams_lines.append(u"- {}".format(v))
-    teams_lines.append(u"")
+    def section(title, color):
+        return (u'<div style="page-break-after:avoid;margin:1.4em 0 0.5em;padding:5px 0;'
+                u'border-bottom:2px solid {c};font-size:1.05em;font-weight:700;color:#1E2235">'
+                u'{t}</div>').format(c=color, t=_esc(title))
 
-if views_removed_entirely:
-    teams_lines.append(u"**🧹 Views no longer used on any sheet**")
-    for v in views_removed_entirely:
-        teams_lines.append(u"- {}".format(v))
-    teams_lines.append(u"")
+    def listblock(title, color, items, ncols):
+        if not items:
+            return u""
+        body = u"".join(
+            u'<div style="font-size:9px;color:#333;padding:1px 8px 1px 0;'
+            u'break-inside:avoid;line-height:1.3">{}</div>'.format(_esc(it)) for it in items)
+        return (u'<div style="page-break-inside:avoid;margin:1.3em 0 0.4em">'
+                u'<div style="padding:5px 0;border-bottom:2px solid {c};font-size:1.05em;'
+                u'font-weight:700;color:#1E2235;margin-bottom:6px">{t}</div>'
+                u'<div style="column-count:{n};column-gap:22px">{b}</div></div>').format(
+                    c=color, t=_esc(title), n=ncols, b=body)
 
-if renumbering_sheets:
-    teams_lines.append(u"**🔢 Detail-number renumbering only** _(cosmetic)_")
-    for r in renumbering_sheets:
-        n = len(r["detail_changes"])
-        teams_lines.append(u"- {} — {} ({} view{})".format(
-            r["sheet_number"], r["curr_name"], n, u"" if n == 1 else u"s"))
-    teams_lines.append(u"")
+    H = []
+    if new_common:
+        H.append(section(u"\U0001f195 New common sheets", u"#27AE60"))
+        H += [sheet_table(b) for b in new_common]
+    if chg_common:
+        H.append(section(u"✳ Changed common sheets", u"#9013FE"))
+        H += [sheet_table(b) for b in chg_common]
+    if rem_common:
+        H.append(section(u"\U0001f5d1 Removed common sheets", u"#E74C3C"))
+        H += [sheet_table(b) for b in rem_common]
 
-if not (sheets_new or sheets_removed or move_pairs or real_adds or real_rems
-        or vtc_all or renames or views_added_entirely
-        or views_removed_entirely or renumbering_sheets):
-    teams_lines.append(u"_No changes detected between the two snapshots._")
+    if custom_blocks:
+        H.append(section(u"\U0001f3d7 Custom sheets (building-specific)", u"#E87E20"))
+        byp = OrderedDict()
+        for b in sorted(custom_blocks, key=lambda x: x["number"]):
+            byp.setdefault(b["prefix"], []).append(b)
+        for pf in sorted(byp):
+            H.append(u'<div style="page-break-after:avoid;margin:0.7em 0 0.2em;font-weight:700;'
+                     u'color:#7A4A12;font-size:0.95em">Building {}</div>'.format(_esc(pf)))
+            for b in byp[pf]:
+                H.append(sheet_table(b))
 
-def _strip_md(txt):
-    out = re.sub(r"\*\*(.+?)\*\*", r"\1", txt)
-    out = re.sub(r"_(.+?)_", r"\1", out)
-    return out
+    H.append(listblock(u"\U0001f9f9 Views no longer used on any sheet ({})".format(len(retired)),
+                       u"#9099C8", list(retired), 4))
+    H.append(listblock(u"✓ Unchanged sheets ({})".format(len(unchanged_only)), u"#7A8090",
+                       [u"{} — {} ({} views)".format(num, name, cnt)
+                        for num, name, cnt in unchanged_only], 3))
 
-teams_plain = _strip_md(u"\r\n".join(teams_lines).rstrip())
+    body_parts = [p for p in H if p]
+    body_html = (u'<p style="color:#27AE60;font-size:1em">&#x2705; No changes detected '
+                 u'between the two snapshots.</p>'
+                 if not body_parts else u"".join(body_parts))
+    summary_html = u" &nbsp;&bull;&nbsp; ".join(_esc(x) for x in summ)
 
-subtitle = u"Previous: {}  ·  Current: {}  ·  {} unchanged".format(
-    prev_date, curr_date, len(unchanged_sheets))
+    return u"""<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>Updates Report</title>
+<style>
+  * {{ box-sizing: border-box; }}
+  body {{ font-family: 'Segoe UI', Arial, sans-serif; margin: 0;
+         color: #1E2235; font-size: 12px; line-height: 1.4; }}
+  h1 {{ font-size: 1.3em; font-weight: 700; color: #1E2235;
+       border-bottom: 3px solid #9013FE; padding-bottom: 0.3em; margin: 0 0 0.2em; }}
+  .meta {{ color: #666; font-size: 0.85em; margin-bottom: 0.8em; }}
+  .summary {{ background: #F5F3FC; border-left: 4px solid #9013FE;
+              padding: 0.5em 1em; margin-bottom: 1.2em;
+              font-size: 0.9em; color: #333; }}
+  @page {{ size: Letter landscape; margin: 1.1cm; }}
+  @media print {{ .no-print {{ display: none; }} }}
+</style>
+</head>
+<body>
+  <div class="no-print" style="background:#1E2235;color:#E8EBF5;
+       padding:10px 16px;margin-bottom:1.2em;border-radius:4px;font-size:0.9em">
+    &#x1F4BE; File saved.
+    &nbsp;&nbsp;&#x1F5A8; To save as PDF: <strong>Ctrl+P</strong>
+    &rarr; choose <em>Save as PDF</em> (landscape).
+  </div>
+  <h1>Detail Sheets Update Report</h1>
+  <div class="meta">
+    <strong>Previous:</strong> {prev_date}
+    &nbsp;&nbsp;&#x2022;&nbsp;&nbsp;
+    <strong>Current:</strong> {curr_date}
+    &nbsp;&nbsp;&#x2022;&nbsp;&nbsp;
+    Generated: {today}
+    &nbsp;&nbsp;&#x2022;&nbsp;&nbsp;
+    {unchanged} unchanged sheet(s)
+  </div>
+  <div class="summary"><strong>Summary:</strong> {summary}</div>
+  {body}
+  <hr style="border:none;border-top:1px solid #DDD;margin:1.5em 0 0.6em">
+  <div style="font-size:0.72em;color:#AAA;text-align:right">
+    Common Details &mdash; Updates Report
+  </div>
+</body>
+</html>""".format(
+        prev_date=_esc(prev_date),
+        curr_date=_esc(curr_date),
+        today=_esc(TODAY_LABEL),
+        unchanged=len(unchanged_only),
+        summary=summary_html,
+        body=body_html)
 
-# ─────────────────────────────────────────────────────────────────────────────
-# 6. Inline XAML builders (data baked in — no bindings needed per sheet)
-# ─────────────────────────────────────────────────────────────────────────────
 
 def _build_sheet_expanders(data_list, expanded=True):
     """Generates XAML Expander elements for a list of (sn, name, changes, badges)."""
@@ -565,186 +701,6 @@ def _build_sheet_expanders(data_list, expanded=True):
                 expanded=u"True" if expanded else u"False",
                 header=header_xaml, rows=rows_xaml)
     return out
-
-
-# ─────────────────────────────────────────────────────────────────────────────
-# 7. HTML report builder (for Export PDF button — sheet-based)
-# ─────────────────────────────────────────────────────────────────────────────
-
-def _esc(text):
-    """Minimal HTML escaping for text nodes."""
-    if text is None:
-        return u""
-    return (unicode(text)
-            .replace(u"&", u"&amp;")
-            .replace(u"<", u"&lt;")
-            .replace(u">", u"&gt;"))
-
-
-def build_html_report():
-    """Sheet-based HTML report; open in browser and Ctrl+P → Save as PDF."""
-    parts = []
-
-    def badge_html(label, color):
-        return (u'<span style="display:inline-block;background:#F0F0FA;'
-                u'border:1px solid {c};color:{c};border-radius:3px;'
-                u'padding:1px 7px;font-size:0.78em;margin-left:6px;'
-                u'font-family:Consolas,monospace">{l}</span>').format(
-                    c=color, l=_esc(label))
-
-    def sheet_section(data_list, section_title, section_color):
-        """Render per-sheet expanders: sheet header + change rows table."""
-        if not data_list:
-            return u""
-        out = (u'<div style="margin-bottom:0.5em;padding:6px 0 4px;'
-               u'border-bottom:2px solid {c};font-size:0.95em;font-weight:700;'
-               u'color:#1E2235;margin-top:1.4em">{title}</div>').format(
-                   c=section_color, title=_esc(section_title))
-        for sn, name, changes, badges in data_list:
-            badge_items = u""
-            for label, fg, _bg, _bd in badges:
-                badge_items += badge_html(label, fg)
-            out += (
-                u'<div style="margin:0.8em 0 0;padding:5px 0 5px 6px;'
-                u'border-left:3px solid #9013FE;page-break-inside:avoid">'
-                u'<span style="font-weight:700;color:#1E2235;font-size:0.91em">'
-                u'{sn}</span>'
-                u'<span style="color:#444;font-size:0.91em;margin-left:8px">'
-                u'{name}</span>'
-                u'{badges}'
-                u'</div>').format(
-                    sn=_esc(sn), name=_esc(name), badges=badge_items)
-            if changes:
-                rows_html = u""
-                for i, (icon, view_name, detail, color) in enumerate(changes):
-                    bg = u"#FAFAFA" if i % 2 == 0 else u"#FFFFFF"
-                    rows_html += (
-                        u'<tr style="background:{bg}">'
-                        u'<td style="width:22px;padding:4px 6px;'
-                        u'font-size:0.88em">{icon}</td>'
-                        u'<td style="padding:4px 8px;font-size:0.88em;'
-                        u'color:#1E2235;max-width:340px;overflow:hidden;'
-                        u'text-overflow:ellipsis;white-space:nowrap">{view}</td>'
-                        u'<td style="padding:4px 8px;font-size:0.88em;'
-                        u'color:{color};white-space:nowrap">{detail}</td>'
-                        u'</tr>').format(
-                            bg=bg, icon=icon,
-                            view=_esc(view_name), detail=_esc(detail),
-                            color=color)
-                out += (
-                    u'<table style="border-collapse:collapse;width:100%;'
-                    u'margin-left:16px;margin-bottom:6px">'
-                    u'<tbody>{}</tbody></table>').format(rows_html)
-        return out
-
-    parts.append(sheet_section(
-        sheet_change_data, u"Sheet content changes", u"#9013FE"))
-    parts.append(sheet_section(
-        renum_change_data,
-        u"Detail-number renumbering only (cosmetic)", u"#5B8EC4"))
-
-    def simple_section(title, color, items, c1_attr, c2_attr):
-        if not items:
-            return u""
-        rows_html = u""
-        for i, r in enumerate(items):
-            bg = u"#FAFAFA" if i % 2 == 0 else u"#FFFFFF"
-            rows_html += (
-                u'<tr style="background:{bg}">'
-                u'<td style="width:22px;padding:4px 6px;font-size:0.88em">'
-                u'{icon}</td>'
-                u'<td style="padding:4px 8px;font-size:0.88em;color:#1E2235">'
-                u'{c1}</td>'
-                u'<td style="padding:4px 8px;font-size:0.88em;color:#555">'
-                u'{c2}</td>'
-                u'</tr>').format(
-                    bg=bg,
-                    icon=getattr(r, "Icon", u""),
-                    c1=_esc(getattr(r, c1_attr, u"")),
-                    c2=_esc(getattr(r, c2_attr, u"")))
-        return (
-            u'<div style="margin-bottom:0.5em;padding:6px 0 4px;'
-            u'border-bottom:2px solid {c};font-size:0.95em;font-weight:700;'
-            u'color:#1E2235;margin-top:1.4em">{title}</div>'
-            u'<table style="border-collapse:collapse;width:100%;'
-            u'margin-bottom:1em">'
-            u'<tbody>{rows}</tbody></table>').format(
-                c=color, title=_esc(title), rows=rows_html)
-
-    parts.append(simple_section(
-        u"New sheets", u"#27AE60", list(new_sheets_oc), "Col1", "Col2"))
-    parts.append(simple_section(
-        u"Removed sheets", u"#E74C3C", list(rem_sheets_oc), "Col1", "Col2"))
-    parts.append(simple_section(
-        u"New views (not on any sheet before)", u"#27AE60",
-        list(new_views_oc), "Col1", "Col2"))
-    parts.append(simple_section(
-        u"Views no longer used on any sheet", u"#9099C8",
-        list(gone_views_oc), "Col1", "Col2"))
-
-    body_parts = [p for p in parts if p]
-    body_html = (
-        u'<p style="color:#27AE60;font-size:1em">&#x2705; No changes detected '
-        u'between the two snapshots.</p>'
-        if not body_parts else u"".join(body_parts))
-
-    summary_html = u" &nbsp;•&nbsp; ".join(_esc(b) for b in headline_bits)
-
-    return u"""<!DOCTYPE html>
-<html lang="en">
-<head>
-<meta charset="utf-8">
-<title>Updates Report</title>
-<style>
-  * {{ box-sizing: border-box; }}
-  body {{ font-family: 'Segoe UI', Arial, sans-serif; margin: 2.2cm 2.5cm;
-         color: #1E2235; font-size: 13px; line-height: 1.5; }}
-  h1 {{ font-size: 1.35em; font-weight: 700; color: #1E2235;
-       border-bottom: 3px solid #9013FE; padding-bottom: 0.35em;
-       margin-bottom: 0.25em; }}
-  .meta {{ color: #666; font-size: 0.87em; margin-bottom: 1em; }}
-  .summary {{ background: #F5F3FC; border-left: 4px solid #9013FE;
-              padding: 0.55em 1em; margin-bottom: 1.8em;
-              font-size: 0.92em; color: #333; }}
-  @media print {{
-    body {{ margin: 1.5cm; }}
-    .no-print {{ display: none; }}
-    a {{ text-decoration: none; color: inherit; }}
-    @page {{ margin: 1.5cm; }}
-  }}
-</style>
-</head>
-<body>
-  <div class="no-print" style="background:#1E2235;color:#E8EBF5;
-       padding:10px 16px;margin-bottom:1.5em;border-radius:4px;font-size:0.9em">
-    &#x1F4BE; File saved.
-    &nbsp;&nbsp;&#x1F5A8; To save as PDF: <strong>Ctrl+P</strong>
-    &rarr; choose <em>Save as PDF</em> (or Microsoft Print to PDF).
-  </div>
-  <h1>Detail Sheets Update Report</h1>
-  <div class="meta">
-    <strong>Previous:</strong> {prev_date}
-    &nbsp;&nbsp;&#x2022;&nbsp;&nbsp;
-    <strong>Current:</strong> {curr_date}
-    &nbsp;&nbsp;&#x2022;&nbsp;&nbsp;
-    Generated: {today}
-    &nbsp;&nbsp;&#x2022;&nbsp;&nbsp;
-    {unchanged} sheet(s) unchanged
-  </div>
-  <div class="summary"><strong>Summary:</strong> {summary}</div>
-  {body}
-  <hr style="border:none;border-top:1px solid #DDD;margin:2em 0 0.8em">
-  <div style="font-size:0.75em;color:#AAA;text-align:right">
-    Common Details &mdash; Updates Report
-  </div>
-</body>
-</html>""".format(
-        prev_date=_esc(prev_date),
-        curr_date=_esc(curr_date),
-        today=_esc(TODAY_LABEL),
-        unchanged=len(unchanged_sheets),
-        summary=summary_html,
-        body=body_html)
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -1020,11 +976,12 @@ win = ui.parse(
     _FOOTER_XAML,
     width=1020,
     height=660,
-    context=u"Diff of two 'Sheets with Views' JSON snapshots. Only the sheets "
-            u"section is compared (master_views is not used here). Use 'Copy "
-            u"Teams message' to copy a formatted summary ready to paste into "
-            u"Teams or email. New/retired-views and renumbering sections are "
-            u"collapsed by default — expand them if needed."
+    context=u"Diff of two 'Sheets with Views' JSON snapshots. Renames are "
+            u"detected by Detail ID, so a renamed view shows as a rename (not "
+            u"remove+add); sheets are matched by number suffix so the report "
+            u"survives a prefix migration. Use 'Copy Teams message' for a "
+            u"paste-ready summary, or 'Export PDF' for the full per-sheet "
+            u"5-column matrix (Added / Removed / Renamed / Renumber / Unchanged)."
 )
 
 # ─── Wire badges and sections ─────────────────────────────────────────────────
@@ -1054,7 +1011,7 @@ if sheet_change_data:
 if renum_change_data:
     n = len(renum_change_data)
     _show_badge("badgeRenumBorder", "badgeRenum",
-                u"🔢  {} renum".format(n))
+                u"\U0001f522  {} renum".format(n))
 
 
 def _wire_oc(oc, badge_border, badge_txt, badge_val,
@@ -1069,16 +1026,16 @@ def _wire_oc(oc, badge_border, badge_txt, badge_val,
 
 
 _wire_oc(new_sheets_oc, "badgeNewSheetsBorder", "badgeNewSheets",
-         u"🆕  {} new".format(new_sheets_oc.Count),
+         u"\U0001f195  {} new".format(new_sheets_oc.Count),
          "expNewSheets", "hdrNewSheetsCount", "icNewSheets")
 _wire_oc(rem_sheets_oc, "badgeRemSheetsBorder", "badgeRemSheets",
-         u"🗑  {} removed".format(rem_sheets_oc.Count),
+         u"\U0001f5d1  {} removed".format(rem_sheets_oc.Count),
          "expRemSheets", "hdrRemSheetsCount", "icRemSheets")
 _wire_oc(new_views_oc,  "badgeNewViewsBorder",  "badgeNewViews",
          u"✨  {} new views".format(new_views_oc.Count),
          "expNewViews",  "hdrNewViewsCount",  "icNewViews")
 _wire_oc(gone_views_oc, "badgeGoneViewsBorder", "badgeGoneViews",
-         u"🧹  {} retired".format(gone_views_oc.Count),
+         u"\U0001f9f9  {} retired".format(gone_views_oc.Count),
          "expGoneViews", "hdrGoneViewsCount", "icGoneViews")
 
 # ─── Copy handler ─────────────────────────────────────────────────────────────
