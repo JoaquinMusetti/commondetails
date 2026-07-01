@@ -23,8 +23,9 @@ from datetime import datetime
 from collections import OrderedDict
 from pyrevit import script, forms
 
+# script.py -> .pushbutton -> Audit.panel -> WIP-ComDet.tab -> <ext root> (4 levels)
 sys.path.append(os.path.join(
-    os.path.dirname(os.path.dirname(os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)))))),
+    os.path.dirname(os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))),
     'lib'
 ))
 from magictools import ui
