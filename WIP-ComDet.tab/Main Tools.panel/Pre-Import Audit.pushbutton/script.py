@@ -3,9 +3,10 @@ __title__ = u'Pre-Import\nAudit'
 __doc__ = (u'Pre-import gate between Export and Import Sheets with Views. '
            u'Compares a Sheets with Views JSON against the destination model: '
            u'reports missing sheets (with a Create action that materialises them '
-           u'from a reference sheet), views not in model, views not placed, '
-           u'removed-or-moved viewports, detail number mismatches, and viewport '
-           u'type mismatches.')
+           u'from a reference sheet), sheet-name mismatches (with a Rename action '
+           u'that updates the sheet Name to match the JSON), views not in model, '
+           u'views not placed, removed-or-moved viewports, detail number '
+           u'mismatches, and viewport type mismatches.')
 
 import sys
 import os as _os
@@ -100,24 +101,65 @@ if not dest_prefix:
 
 dest_prefix = dest_prefix.strip().upper()
 
-# Filter JSON sheets to this building. A Common Details export carries sheets
-# for every building (AA, AE, AB, AG…) plus shared AX details; without this
-# filter their suffixes collide (all map to the same dest sheet number).
 SHARED_PREFIX = u"AX"
+
+
+def _building_tag(sheet_number):
+    """Trailing building letter of a sheet number, or None for a shared sheet.
+
+    Number = <2-char prefix> + base + optional '.<Letter>'. The base itself
+    contains dots (e.g. '10.65'), so only a final segment that is exactly one
+    alphabetic char counts as a building tag ('10.65.E' -> 'E', '10.65' -> None)."""
+    if not sheet_number:
+        return None
+    suffix = sheet_number[2:] if len(sheet_number) > 2 else sheet_number
+    parts = suffix.split(u".")
+    last = parts[-1] if parts else u""
+    if len(last) == 1 and last.isalpha():
+        return last.upper()
+    return None
+
+
+def _dest_building_letter(prefix):
+    """Building letter implied by a 2-char destination prefix, else None.
+
+    'AE'->'E', 'AS'->'S'. Shared 'AX' and Common Details 'CD' map to no single
+    building -> None (keep everything, don't over-filter)."""
+    if (len(prefix) == 2 and prefix[0] == u"A"
+            and prefix != SHARED_PREFIX and prefix[1].isalpha()):
+        return prefix[1]
+    return None
+
+
+# Filter JSON sheets to this destination building. The CD export carries every
+# building's CUSTOM sheets (all AX-prefixed, tagged '.A', '.E'…) plus SHARED
+# sheets (no letter tag). Keep a sheet only if it is shared (no tag) or its tag
+# matches this building's letter, so building E is not told it's "missing"
+# building A's custom AX10.65.A. Suffix matching downstream ('10.65' vs
+# '10.65.E') keeps them distinct, so there is no collision.
+_dest_letter = _dest_building_letter(dest_prefix)
 _full_count = len(layout)
-layout = [sd for sd in layout
-          if sd.get("sheet_number", u"")[:2].upper() in (dest_prefix, SHARED_PREFIX)]
-skipped = _full_count - len(layout)
+if _dest_letter is None:
+    # Can't identify one building (dest is AX / CD) -> keep all, don't over-filter.
+    skipped = 0
+else:
+    kept = []
+    for sd in layout:
+        tag = _building_tag(sd.get("sheet_number", u""))
+        if tag is None or tag == _dest_letter:
+            kept.append(sd)
+    layout = kept
+    skipped = _full_count - len(layout)
 
 if not layout:
     ui.alert(
-        u"No sheets in the JSON match prefix '{}' or the shared '{}' prefix.\n\n"
-        u"The JSON has {} sheet(s) for other buildings. Check that you entered "
-        u"the right destination prefix.".format(dest_prefix, SHARED_PREFIX, _full_count),
+        u"The JSON has no shared sheets and no custom sheets for building '{}'.\n\n"
+        u"It contains {} sheet(s) total (shared + other buildings). Check that "
+        u"you entered the right destination prefix.".format(dest_prefix, _full_count),
         title=u"Pre-Import Audit",
-        context=u"This export contains custom details for multiple buildings. "
-                u"The audit only processes sheets whose number starts with the "
-                u"destination prefix you entered or the shared 'AX' prefix."
+        context=u"Shared Common Details sheets (no trailing building letter) apply "
+                u"to every building; a sheet tagged '.X' belongs only to building X. "
+                u"The audit keeps shared sheets plus this building's custom sheets."
     )
     script.exit()
 
@@ -361,9 +403,13 @@ orphan_oc     = ObservableCollection[object]()   # ↻  viewport on sheet, not i
 detnum_oc     = ObservableCollection[object]()   # 🔢 detail number mismatch
 vptype_oc     = ObservableCollection[object]()   # 🖼  viewport type mismatch
 viewtype_oc   = ObservableCollection[object]()   # 🔄 view type mismatch
+namemismatch_oc = ObservableCollection[object]() # ✏ sheet name differs from JSON
 
 # Parallel list for sheet creation — (dest_num, json_sheet_name)
 not_found_list = []
+
+# Parallel list for sheet rename — (sheet ElementId, dest_num, current_name, json_name)
+name_mismatch_list = []
 
 sheets_ok = 0
 
@@ -392,6 +438,15 @@ for sheet_data in layout:
                 vp, get_detail_number(vp), get_viewport_type_name(vp), view_type)
 
     sheet_had_issue = False
+
+    # Sheet exists but its .Name differs from the JSON sheet_name
+    model_name = target_sheet.Name
+    if sheet_name and model_name and sheet_name != model_name:
+        namemismatch_oc.Add(_IssueRow(
+            u"✏", dest_num, model_name, u"should be: {}".format(sheet_name)))
+        name_mismatch_list.append(
+            (target_sheet.Id, dest_num, model_name, sheet_name))
+        sheet_had_issue = True
 
     # Views in JSON but not found as dependent views in the model
     for vname in json_vp_dict:
@@ -474,8 +529,9 @@ n_orphan     = orphan_oc.Count
 n_detnum     = detnum_oc.Count
 n_vptype     = vptype_oc.Count
 n_viewtype   = viewtype_oc.Count
+n_namemismatch = namemismatch_oc.Count
 n_issues     = (n_not_found + n_not_model + n_not_placed +
-                n_orphan + n_detnum + n_vptype + n_viewtype)
+                n_orphan + n_detnum + n_vptype + n_viewtype + n_namemismatch)
 
 if n_issues == 0:
     subtitle = u"✅  All {} sheets ready to import  ·  prefix {}  ·  {}".format(
@@ -483,6 +539,10 @@ if n_issues == 0:
 elif n_not_found > 0 and (n_issues - n_not_found) == 0:
     subtitle = u"❌  {} sheet{} missing — create them before importing  ·  prefix {}  ·  {}".format(
         n_not_found, u"s" if n_not_found != 1 else u"",
+        dest_prefix, _os.path.basename(json_path))
+elif n_namemismatch > 0 and (n_issues - n_namemismatch) == 0:
+    subtitle = u"✏  {} sheet name{} differ — rename to match the JSON  ·  prefix {}  ·  {}".format(
+        n_namemismatch, u"s" if n_namemismatch != 1 else u"",
         dest_prefix, _os.path.basename(json_path))
 else:
     subtitle = u"{} sheets  ·  prefix {}  ·  {}".format(
@@ -642,6 +702,12 @@ _BODY_XAML = u"""
       <TextBlock x:Name="badgeViewType" Foreground="#E87E20"
                  FontFamily="Segoe UI" FontSize="13"/>
     </Border>
+    <Border x:Name="badgeNameMismatchBorder" Background="#0E2A2A" BorderBrush="#3FC8C8"
+            BorderThickness="1" CornerRadius="4" Padding="10,4" Margin="0,0,8,0"
+            Visibility="Collapsed">
+      <TextBlock x:Name="badgeNameMismatch" Foreground="#3FC8C8"
+                 FontFamily="Segoe UI" FontSize="13"/>
+    </Border>
   </StackPanel>
 
   <!-- Scrollable body -->
@@ -668,6 +734,22 @@ _BODY_XAML = u"""
           </StackPanel>
         </Expander.Header>
         <ItemsControl x:Name="icNotFound" ItemTemplate="{StaticResource rowTpl}"/>
+      </Expander>
+
+      <!-- ✏ Sheet name mismatches — actionable: Rename sheets -->
+      <Expander x:Name="expNameMismatch" IsExpanded="True" Visibility="Collapsed" Margin="0,0,0,2">
+        <Expander.Header>
+          <StackPanel Orientation="Horizontal">
+            <Border Background="#0E2A2A" BorderBrush="#3FC8C8" BorderThickness="1"
+                    CornerRadius="4" Padding="7,2" Margin="0,0,10,0">
+              <TextBlock x:Name="hdrNameMismatchCount" Foreground="#3FC8C8"
+                         FontFamily="Consolas" FontSize="12"/>
+            </Border>
+            <TextBlock Text="&#x270F;  Sheet name mismatches" Foreground="#E8EBF5"
+                       FontFamily="Segoe UI" FontSize="13" VerticalAlignment="Center"/>
+          </StackPanel>
+        </Expander.Header>
+        <ItemsControl x:Name="icNameMismatch" ItemTemplate="{StaticResource rowTpl}"/>
       </Expander>
 
       <!-- 🔴 Views not in model — SECOND (actionable via Import) -->
@@ -793,6 +875,10 @@ _FOOTER_XAML = u"""
               Style="{StaticResource BtnPrimary}"
               Margin="0,0,8,0" Visibility="Collapsed"
               ToolTip="Creates empty sheets in this model based on the JSON, cloning title block and parameters from a reference sheet you choose."/>
+      <Button x:Name="btnRenameSheets" Content="Rename 0 sheets"
+              Style="{StaticResource BtnPrimary}"
+              Margin="0,0,8,0" Visibility="Collapsed"
+              ToolTip="Renames existing sheets so their Sheet Name matches the JSON. You choose which; Revit sheet names need not be unique."/>
       <Button x:Name="btnClose" Content="Close" Style="{StaticResource BtnGhost}"/>
     </StackPanel>
   </Grid>
@@ -860,6 +946,9 @@ _wire_section(vptype_oc,     "badgeVpTypeBorder",    "badgeVpType",
 _wire_section(viewtype_oc,   "badgeViewTypeBorder",  "badgeViewType",
               u"\U0001f504  {} view-type".format(n_viewtype),
               "expViewType",  "hdrViewTypeCount",  "icViewType")
+_wire_section(namemismatch_oc, "badgeNameMismatchBorder", "badgeNameMismatch",
+              u"✏  {} name".format(n_namemismatch),
+              "expNameMismatch", "hdrNameMismatchCount", "icNameMismatch")
 
 # Wire Create sheets button
 if not_found_oc.Count > 0:
@@ -867,6 +956,13 @@ if not_found_oc.Count > 0:
     btn_create.Content = u"Create {} sheet{}".format(
         not_found_oc.Count, u"s" if not_found_oc.Count != 1 else u"")
     btn_create.Visibility = Visibility.Visible
+
+# Wire Rename sheets button
+if namemismatch_oc.Count > 0:
+    btn_rename = win.FindName("btnRenameSheets")
+    btn_rename.Content = u"Rename {} sheet{}".format(
+        namemismatch_oc.Count, u"s" if namemismatch_oc.Count != 1 else u"")
+    btn_rename.Visibility = Visibility.Visible
 
 # ─── Create sheets handler ─────────────────────────────────────────────────────
 
@@ -991,11 +1087,114 @@ def on_create_sheets(s, e):
     lbl.Visibility = Visibility.Visible
 
 
+# ─── Rename sheets handler ─────────────────────────────────────────────────────
+
+def on_rename_sheets(s, e):
+    if not name_mismatch_list:
+        return
+
+    chosen = ui.pick_list(
+        list(name_mismatch_list),
+        u"Which sheets to rename?",
+        multiselect=True,
+        name_fn=lambda t: u"{}:  {}  →  {}".format(t[1], t[2], t[3]),
+        context=(u"Select which sheets to rename so their Sheet Name matches the "
+                 u"JSON. Revit sheet names are not required to be unique, so this "
+                 u"cannot collide. Only Sheet Name changes; Sheet Number is untouched.")
+    )
+    if not chosen:          # None (cancelled) or empty selection
+        return
+    to_rename = list(chosen)
+
+    renamed   = 0
+    failed    = 0
+    fail_msgs = []
+
+    t = DB.Transaction(doc, u"Rename sheets to match JSON")
+    t.Start()
+    try:
+        for sheet_id, dest_num, cur_name, json_name in to_rename:
+            try:
+                sheet_el = doc.GetElement(sheet_id)
+                if sheet_el is None:
+                    failed += 1
+                    fail_msgs.append(u"  {} — sheet no longer exists".format(dest_num))
+                    continue
+                sheet_el.Name = json_name
+                renamed += 1
+            except Exception as ex:
+                failed += 1
+                fail_msgs.append(u"  {} — {}".format(dest_num, ex))
+        t.Commit()
+    except Exception as ex_outer:
+        try:
+            t.RollBack()
+        except Exception:
+            pass
+        lbl = win.FindName("lblStatus")
+        lbl.Text = u"❌ Transaction failed: {}".format(ex_outer)
+        lbl.Visibility = Visibility.Visible
+        return
+
+    # Rebuild caches and re-check which name mismatches remain
+    new_caches = _build_caches(doc)
+    new_s_by_suffix = new_caches['sheet_by_suffix']
+
+    del name_mismatch_list[:]
+    namemismatch_oc.Clear()
+
+    for sheet_data in layout:
+        snum  = sheet_data["sheet_number"]
+        sname = sheet_data.get("sheet_name", u"")
+        sfx   = snum[2:] if len(snum) > 2 else snum
+        d_num = u"{}{}".format(dest_prefix, sfx)
+        if sfx in new_s_by_suffix:
+            tgt   = new_s_by_suffix[sfx]
+            mname = tgt.Name
+            if sname and mname and sname != mname:
+                name_mismatch_list.append((tgt.Id, d_num, mname, sname))
+                namemismatch_oc.Add(_IssueRow(
+                    u"✏", d_num, mname, u"should be: {}".format(sname)))
+
+    # Update button + expander + badge
+    btn  = win.FindName("btnRenameSheets")
+    exp  = win.FindName("expNameMismatch")
+    bbdr = win.FindName("badgeNameMismatchBorder")
+    btxt = win.FindName("badgeNameMismatch")
+    hdr  = win.FindName("hdrNameMismatchCount")
+
+    if namemismatch_oc.Count == 0:
+        btn.Visibility  = Visibility.Collapsed
+        exp.Visibility  = Visibility.Collapsed
+        bbdr.Visibility = Visibility.Collapsed
+    else:
+        n_rem = namemismatch_oc.Count
+        btn.Content = u"Rename {} sheet{}".format(n_rem, u"s" if n_rem != 1 else u"")
+        btxt.Text   = u"✏  {} name".format(n_rem)
+        hdr.Text    = u" {} ".format(n_rem)
+
+    # Update subtitle
+    new_sub = u"✓ Renamed {}  ·  {} sheets  ·  prefix {}  ·  {}".format(
+        renamed, len(layout), dest_prefix, _os.path.basename(json_path))
+    win.FindName("__noir_subtitle__").Text = new_sub
+
+    # Status line
+    lbl = win.FindName("lblStatus")
+    if failed:
+        lbl.Text = u"❌ {} sheet(s) could not be renamed:\n{}".format(
+            failed, u"\n".join(fail_msgs))
+    else:
+        lbl.Text = u"✓ {} sheet{} renamed successfully.".format(
+            renamed, u"s" if renamed != 1 else u"")
+    lbl.Visibility = Visibility.Visible
+
+
 # ─── Copy handler ─────────────────────────────────────────────────────────────
 
 def on_copy(s, e):
     sections = [
         (not_found_oc,  u"Sheets not found in model"),
+        (namemismatch_oc, u"Sheet name mismatches"),
         (not_model_oc,  u"Views not in model"),
         (not_placed_oc, u"Views not placed on sheet"),
         (orphan_oc,     u"Removed or moved viewports"),
@@ -1027,6 +1226,7 @@ def on_copy(s, e):
 # ─── Wire events ──────────────────────────────────────────────────────────────
 
 win.FindName("btnCreateSheets").Click += on_create_sheets
+win.FindName("btnRenameSheets").Click += on_rename_sheets
 win.FindName("btnCopy").Click          += on_copy
 win.FindName("btnClose").Click         += lambda s, e: win.Close()
 
