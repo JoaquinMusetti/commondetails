@@ -21,6 +21,7 @@ while _ext_dir and not _ext_dir.endswith('.extension'):
     _ext_dir = _os.path.dirname(_ext_dir)
 sys.path.append(_os.path.join(_ext_dir, 'lib'))
 from magictools import ui
+from sheet_naming import building_tag, dest_building_letter
 
 doc   = revit.doc
 output = script.get_output()
@@ -271,21 +272,24 @@ if not sheets_in_json:
     )
     script.exit()
 
-# Filter JSON sheets to this building: keep only sheets whose source prefix
-# matches the destination prefix or the shared "AX" common-details prefix.
-# A multi-building export carries sheets for every building; without this the
-# picker would list (and could import) details from the wrong buildings.
-SHARED_PREFIX = u"AX"
+# Filter JSON sheets to this destination building. The CD export carries every
+# building's CUSTOM sheets (all AX-prefixed, tagged '.A', '.E'…) plus SHARED
+# sheets (no letter tag). Keep a sheet only if it is shared (no tag) or its tag
+# matches this building's letter -- same rule the Pre-Import Audit uses
+# (building_tag / dest_building_letter live in lib/sheet_naming.py). Filtering by
+# the leading 2-char prefix would keep every building's AX-prefixed customs.
+_dest_letter = dest_building_letter(dest_prefix)
 _full = len(sheets_in_json)
-sheets_in_json = [sh for sh in sheets_in_json
-                  if sh.get("sheet_number", u"")[:2].upper() in (dest_prefix, SHARED_PREFIX)]
+if _dest_letter is not None:
+    sheets_in_json = [sh for sh in sheets_in_json
+                      if building_tag(sh.get("sheet_number", u"")) in (None, _dest_letter)]
 _skipped = _full - len(sheets_in_json)
 
 if not sheets_in_json:
     ui.alert(
-        u"No sheets in the JSON match prefix '{}' or the shared '{}' prefix.\n\n"
-        u"The JSON has {} sheet(s) for other buildings. Re-run and enter the "
-        u"correct destination prefix.".format(dest_prefix, SHARED_PREFIX, _full),
+        u"The JSON has no shared sheets and no custom sheets for building '{}'.\n\n"
+        u"It contains {} sheet(s) total (shared + other buildings). Re-run and "
+        u"enter the correct destination prefix.".format(dest_prefix, _full),
         title=u"Import Sheets with Views"
     )
     script.exit()
@@ -300,8 +304,9 @@ chosen_sheet_opts = ui.pick_list(
     sheet_options,
     "3 of 5 — Select Sheets to Import",
     multiselect=True,
-    context=(u"Only sheets for prefix {} and shared AX are shown ({} from other "
-             u"buildings hidden). Tick the sheets you want to bring into the active "
+    context=(u"Only shared sheets plus building '{}'s custom sheets are shown "
+             u"({} from other buildings hidden). Tick the sheets you want to bring "
+             u"into the active "
              u"model. The tool figures out which dependent views each sheet needs "
              u"and creates them automatically under their matching master views. "
              u"Sheets you don't tick (and any views unique to them) are skipped "
@@ -404,8 +409,12 @@ all_views_dest = DB.FilteredElementCollector(doc).OfClass(DB.View).ToElements()
 view_by_name      = {}
 template_by_name  = {}
 dep_view_by_name  = {}
-view_by_detail_id = {}   # global Detail ID → LIST of dependent views (handles duplicates)
 
+# NOTE: dependent views are matched by NAME only. Detail ID is still STAMPED from
+# the JSON onto new/blank views (identity for Export + the Detect Renames tool),
+# but it is deliberately NOT used to match — duplicate Detail IDs (from copied
+# views) made ID matching ambiguous and broke the import. Rename detection now
+# lives in the opt-in "Detect Renames" tool.
 for v in all_views_dest:
     try:
         view_by_name[v.Name] = v
@@ -415,9 +424,6 @@ for v in all_views_dest:
             pid = v.GetPrimaryViewId()
             if pid != DB.ElementId.InvalidElementId:
                 dep_view_by_name[v.Name] = v
-                _did = get_detail_id(v)
-                if _did:
-                    view_by_detail_id.setdefault(_did, []).append(v)
     except Exception:
         pass
 
@@ -527,14 +533,11 @@ class _PFRow(object):
 _pf_rows       = _OC_PF[_PFRow]()
 _pf_type_ids   = []   # ElementIds with type mismatch — candidates for delete
 _pf_scale_ids  = []   # ElementIds with scale mismatch — candidates for delete
-_pf_name_fixes = []   # [(ElementId, new_name)] — candidates for rename
 
 # Counters populated when fixes actually execute (used by results window badges)
 n_type_fixed   = 0
 n_scale_fixed  = 0
-n_renamed      = 0
-n_old_marked   = 0
-name_fix_errors = []   # [(view_id_str, error_msg)] for results window Issues section
+fix_errors     = []   # [(view_id_str, error_msg)] for results window Issues section
 
 for _mv in data["master_views"]:
     _mname = _mv["view_name"]
@@ -544,41 +547,17 @@ for _mv in data["master_views"]:
 
     for _dv in _mv["dependent_views"]:
         _dv_name    = _dv["view_name"]
-        _dv_id      = _dv.get("detail_id", "")
         _json_scale = _dv.get("view_scale", _mview.Scale)
 
-        # ── Precedence: exact (ID+name) > ID-only (only if unambiguous) > name-only ──
-        # When multiple views share a Detail ID (e.g. user duplicated a view), prefer
-        # the one whose name matches the JSON. If no exact match exists, ID-only is
-        # only honored when there's a single candidate — otherwise it's ambiguous and
-        # we skip ID matching for this entry to avoid spurious rename suggestions.
-        _ex = None
-        _has_name_mismatch = False
-
-        if _dv_id:
-            _candidates = view_by_detail_id.get(_dv_id, [])
-            # Look for exact name match among ID candidates first
-            _exact = None
-            for _c in _candidates:
-                if _c.Name == _dv_name:
-                    _exact = _c
-                    break
-            if _exact is not None:
-                _ex = _exact                       # exact match — canonical
-            elif len(_candidates) == 1:
-                _ex = _candidates[0]               # ID match, name differs (unambiguous)
-                _has_name_mismatch = True
-            # else: multiple ID candidates and none match the name → ambiguous,
-            # fall through to name-only matching
-
-        if _ex is None:
-            _ex = dep_view_by_name.get(_dv_name)  # name-only match
+        # Match by NAME only. Detail ID is deliberately not used to match here
+        # (duplicate IDs from copied views made it ambiguous). Rename detection
+        # lives in the opt-in "Detect Renames" tool.
+        _ex = dep_view_by_name.get(_dv_name)
 
         if _ex is None:
             continue   # new view — Phase A will create it
 
         # ── Structural mismatch: type takes precedence over scale ─────────────
-        will_be_deleted = False
         try:
             if _ex.ViewType != _mview.ViewType:
                 _pf_rows.Add(_PFRow(
@@ -586,7 +565,6 @@ for _mv in data["master_views"]:
                     _vt_label(_ex), _vt_label(_mview)
                 ))
                 _pf_type_ids.append(_ex.Id)
-                will_be_deleted = True
             elif _ex.Scale != _json_scale:
                 _pf_rows.Add(_PFRow(
                     u"⚠", _dv_name, u"Scale changed",
@@ -594,27 +572,16 @@ for _mv in data["master_views"]:
                     u"1 : {}".format(_json_scale)
                 ))
                 _pf_scale_ids.append(_ex.Id)
-                will_be_deleted = True
         except Exception:
             pass
-
-        # Name mismatch only matters if the view will SURVIVE Phase A
-        # (a deleted view doesn't need its name fixed — Phase A recreates with JSON name)
-        if _has_name_mismatch and not will_be_deleted:
-            _pf_rows.Add(_PFRow(
-                u"✏", _dv_name, u"Name mismatch", _ex.Name, _dv_name
-            ))
-            _pf_name_fixes.append((_ex.Id, _dv_name))
 
 # ── Modal + fix transactions ────────────────────────────────────────────────
 if len(_pf_rows) > 0:
     _n_type  = sum(1 for _r in _pf_rows if _r.Issue == u"Type changed")
     _n_scale = sum(1 for _r in _pf_rows if _r.Issue == u"Scale changed")
-    _n_name  = sum(1 for _r in _pf_rows if _r.Issue == u"Name mismatch")
     _pf_parts = []
     if _n_type:  _pf_parts.append(u"{} type".format(_n_type))
     if _n_scale: _pf_parts.append(u"{} scale".format(_n_scale))
-    if _n_name:  _pf_parts.append(u"{} name".format(_n_name))
 
     _PF_BODY = u"""
 <Grid>
@@ -654,9 +621,6 @@ if len(_pf_rows) > 0:
     <CheckBox x:Name="chkFixScale" Visibility="Collapsed" IsChecked="True"
               Foreground="#E8EBF5" FontFamily="Segoe UI" FontSize="12" Margin="0,2,0,2"
               Content="⚠  Fix scale mismatches — delete the old dependent, Phase A recreates it from the correct-scale master"/>
-    <CheckBox x:Name="chkFixName"  Visibility="Collapsed" IsChecked="True"
-              Foreground="#E8EBF5" FontFamily="Segoe UI" FontSize="12" Margin="0,2,0,2"
-              Content="✏  Fix name mismatches — rename destination view to match the source name (any colliding view gets a '(old)' suffix)"/>
   </StackPanel>
 </Grid>
 """
@@ -674,21 +638,18 @@ if len(_pf_rows) > 0:
 
     _pf_win = ui.parse(
         u"Pre-flight — Mismatched Views",
-        u"⚠  " + u"  \xb7  ".join(_pf_parts) + u" mismatch" + (u"es" if (_n_type + _n_scale + _n_name) > 1 else u""),
+        u"⚠  " + u"  \xb7  ".join(_pf_parts) + u" mismatch" + (u"es" if (_n_type + _n_scale) > 1 else u""),
         _PF_BODY, _PF_FOOTER,
         width=920, height=560,
         context=u"Tick the fix boxes you want to apply before the import runs. "
                 u"Type/scale fixes delete the old dependent so Phase A recreates it from "
-                u"the correct master. Name fix renames the destination view to match the "
-                u"source — if another view already has that name, the colliding view is "
-                u"renamed to '<name> (old)'."
+                u"the correct master."
     )
     _pf_win.FindName("dgPF").ItemsSource = _pf_rows
 
     from System.Windows import Visibility as _PFVis
     if _n_type:  _pf_win.FindName("chkFixType").Visibility  = _PFVis.Visible
     if _n_scale: _pf_win.FindName("chkFixScale").Visibility = _PFVis.Visible
-    if _n_name:  _pf_win.FindName("chkFixName").Visibility  = _PFVis.Visible
 
     _pf_proceed = [False]
 
@@ -702,7 +663,6 @@ if len(_pf_rows) > 0:
     # Capture checkbox state BEFORE closing the window (FindName fails after Close)
     _fix_type_chk  = _pf_win.FindName("chkFixType")
     _fix_scale_chk = _pf_win.FindName("chkFixScale")
-    _fix_name_chk  = _pf_win.FindName("chkFixName")
 
     _pf_win.ShowDialog()
 
@@ -711,9 +671,8 @@ if len(_pf_rows) > 0:
 
     _fix_type  = _n_type  > 0 and bool(_fix_type_chk.IsChecked)
     _fix_scale = _n_scale > 0 and bool(_fix_scale_chk.IsChecked)
-    _fix_name  = _n_name  > 0 and bool(_fix_name_chk.IsChecked)
 
-    # ── Fix tx 1: delete master-mismatched views (type + scale combined) ────
+    # ── Fix tx: delete master-mismatched views (type + scale combined) ──────
     _delete_ids = []
     if _fix_type:  _delete_ids += _pf_type_ids
     if _fix_scale: _delete_ids += _pf_scale_ids
@@ -726,69 +685,14 @@ if len(_pf_rows) > 0:
                     if _eid in _pf_type_ids:  n_type_fixed  += 1
                     if _eid in _pf_scale_ids: n_scale_fixed += 1
                 except Exception as _e:
-                    name_fix_errors.append((str(_eid.IntegerValue),
-                                            u"Delete failed: {}".format(_e)))
+                    fix_errors.append((str(_eid.IntegerValue),
+                                       u"Delete failed: {}".format(_e)))
 
-    # ── Fix tx 2: rename name-mismatched views with collision-to-(old) ──────
-    if _fix_name and _pf_name_fixes:
-
-        def _name_taken(name, exclude_id=None):
-            for _v in DB.FilteredElementCollector(doc).OfClass(DB.View).ToElements():
-                try:
-                    if exclude_id is not None and _v.Id == exclude_id:
-                        continue
-                    if not _v.IsTemplate and _v.Name == name:
-                        return True
-                except Exception:
-                    pass
-            return False
-
-        def _apply_name_fix(eid, new_name):
-            v = doc.GetElement(eid)
-            if v is None:
-                return ("missing", None)
-            collider = None
-            for other in DB.FilteredElementCollector(doc).OfClass(DB.View).ToElements():
-                try:
-                    if other.Id != v.Id and not other.IsTemplate and other.Name == new_name:
-                        collider = other
-                        break
-                except Exception:
-                    pass
-            collider_renamed_to = None
-            if collider is not None:
-                candidate = u"{} (old)".format(new_name)
-                _n = 2
-                while _name_taken(candidate, exclude_id=collider.Id):
-                    candidate = u"{} (old {})".format(new_name, _n)
-                    _n += 1
-                try:
-                    collider.Name = candidate
-                    collider_renamed_to = candidate
-                except Exception as _ce:
-                    return ("collider_rename_failed", str(_ce))
-            try:
-                v.Name = new_name
-                return ("ok", collider_renamed_to)
-            except Exception as _re:
-                return ("rename_failed", str(_re))
-
-        with revit.Transaction("Import — Fix name mismatches"):
-            for _eid, _new_name in _pf_name_fixes:
-                _status, _collider_new = _apply_name_fix(_eid, _new_name)
-                if _status == "ok":
-                    n_renamed += 1
-                    if _collider_new is not None:
-                        n_old_marked += 1
-                else:
-                    name_fix_errors.append((_new_name, u"{}: {}".format(_status, _collider_new or u"")))
-
-    # ── Rebuild stale indices if anything was changed ───────────────────────
-    if _delete_ids or (_fix_name and _pf_name_fixes):
+    # ── Rebuild stale indices if anything was deleted ───────────────────────
+    if _delete_ids:
         view_by_name      = {}
         template_by_name  = {}
         dep_view_by_name  = {}
-        view_by_detail_id = {}
         for _v in DB.FilteredElementCollector(doc).OfClass(DB.View).ToElements():
             try:
                 view_by_name[_v.Name] = _v
@@ -797,9 +701,6 @@ if len(_pf_rows) > 0:
                 else:
                     if _v.GetPrimaryViewId() != DB.ElementId.InvalidElementId:
                         dep_view_by_name[_v.Name] = _v
-                        _did = get_detail_id(_v)
-                        if _did:
-                            view_by_detail_id.setdefault(_did, []).append(_v)
             except Exception:
                 pass
         existing_proj_names = set(view_by_name.keys())
@@ -878,15 +779,11 @@ with ui.ProgressBar(title=u"Import Sheets with Views", cancellable=True, step=5)
             master_view = view_by_name[view_name]
             view_results.append(("master", view_name, "", ""))
 
-            existing_by_id   = {}   # Detail ID → LIST of dep views (handles duplicates)
             existing_by_name = {}
             for vid in master_view.GetDependentViewIds():
                 dep = doc.GetElement(vid)
                 if dep:
                     existing_by_name[dep.Name] = dep
-                    did = get_detail_id(dep)
-                    if did:
-                        existing_by_id.setdefault(did, []).append(dep)
 
             pending_crops = []
 
@@ -906,34 +803,16 @@ with ui.ProgressBar(title=u"Import Sheets with Views", cancellable=True, step=5)
                     for c in dv_data["crop_corners"]
                 ]
 
-                # Precedence: exact (ID+name) > ID-only (only if unambiguous) > name-only.
-                # Multiple dependents can share a Detail ID after duplication; prefer
-                # the one whose name matches. Ambiguous IDs fall through to name-only.
-                existing_view = None
-                _matched_by_id = False
-                if dv_id:
-                    _id_cands = existing_by_id.get(dv_id, [])
-                    for _c in _id_cands:
-                        if _c.Name == dv_name:
-                            existing_view = _c
-                            _matched_by_id = True
-                            break
-                    if existing_view is None and len(_id_cands) == 1:
-                        existing_view = _id_cands[0]
-                        _matched_by_id = True
-                if existing_view is None:
-                    existing_view = existing_by_name.get(dv_name)
+                # Match by name only (see note at top: Detail ID is stamped, not matched).
+                existing_view = existing_by_name.get(dv_name)
 
                 processed += 1
                 pb.title = u"Importing views — {}/{} — {}".format(
                     processed, total_views + len(sheets_data), view_name)
                 pb.update_progress(processed, total_views + len(sheets_data))
 
-                # Already exists
+                # Already exists (matched by name)
                 if existing_view is not None:
-                    # Register under the JSON name so Phase B can find it even if
-                    # the destination view has a different name (e.g. matched by
-                    # detail_id but renamed in the destination model).
                     phase_a_lookup[dv_name] = existing_view
 
                     if dv_id and not get_detail_id(existing_view):
@@ -953,9 +832,7 @@ with ui.ProgressBar(title=u"Import Sheets with Views", cancellable=True, step=5)
                                         p.Set(title_on_sheet)
                                 except Exception:
                                     pass
-                            match_reason = (u"matched by Detail ID" if _matched_by_id
-                                            else u"matched by name")
-                            _det = u"crop updated  •  {}".format(match_reason)
+                            _det = u"crop updated  •  matched by name"
                             view_results.append(("updated", view_name, existing_view.Name, _det))
                             phase_a_result_by_view[dv_name] = (u"🔄", u"updated", _det)
                             total_v_updated += 1
@@ -963,9 +840,7 @@ with ui.ProgressBar(title=u"Import Sheets with Views", cancellable=True, step=5)
                             view_results.append(("error", view_name, dv_name, str(e)))
                             phase_a_result_by_view[dv_name] = (u"❌", u"error", str(e)[:80])
                     else:
-                        match_reason = (u"matched by Detail ID" if _matched_by_id
-                                        else u"matched by name")
-                        _det = u"already exists, strategy = keep  •  {}".format(match_reason)
+                        _det = u"already exists, strategy = keep  •  matched by name"
                         view_results.append(("skipped", view_name, existing_view.Name, _det))
                         phase_a_result_by_view[dv_name] = (u"⏭️", u"kept", _det)
                         total_v_skipped += 1
@@ -1711,8 +1586,8 @@ for _st, _master, _vn, _det in view_results:
     elif _st == "error":
         issues_oc.Add(_IssueRow(u"❌", u"View error: {}  /  {}".format(_master, _vn), _det))
 
-for _nfe_subject, _nfe_detail in name_fix_errors:
-    issues_oc.Add(_IssueRow(u"⚠", u"Name fix: {}".format(_nfe_subject), _nfe_detail))
+for _nfe_subject, _nfe_detail in fix_errors:
+    issues_oc.Add(_IssueRow(u"⚠", u"Fix: {}".format(_nfe_subject), _nfe_detail))
 
 
 # ── Subtitle & counts ─────────────────────────────────────────────────────────
@@ -1729,8 +1604,6 @@ if vp_cleaned:
     subtitle += u"  \xb7  {} cleaned".format(vp_cleaned)
 if n_type_fixed or n_scale_fixed:
     subtitle += u"  \xb7  {} fixed".format(n_type_fixed + n_scale_fixed)
-if n_renamed:
-    subtitle += u"  \xb7  {} renamed".format(n_renamed)
 if n_errors:
     subtitle += u"  \xb7  {} error{}".format(n_errors, u"s" if n_errors != 1 else u"")
 if master_map_info:
@@ -1741,7 +1614,6 @@ if cancelled:
 # ── Pre-flight view-name sets (used by badge filters) ────────────────────────
 _type_fixed_names  = {r._view_name for r in _pf_rows if r._issue == u"Type changed"}
 _scale_fixed_names = {r._view_name for r in _pf_rows if r._issue == u"Scale changed"}
-_renamed_names     = {r._view_name for r in _pf_rows if r._issue == u"Name mismatch"}
 
 _BODY_XAML = u"""
 <Grid>
@@ -1854,16 +1726,6 @@ _BODY_XAML = u"""
             BorderThickness="1" CornerRadius="4" Padding="10,4" Margin="0,0,8,6"
             Cursor="Hand" Visibility="Collapsed">
       <TextBlock x:Name="badgeScaleFixed" Foreground="#F0A050" FontFamily="Segoe UI" FontSize="13"/>
-    </Border>
-    <Border x:Name="badgeRenamedBorder" Background="#0F2A2E" BorderBrush="#5ED4D4"
-            BorderThickness="1" CornerRadius="4" Padding="10,4" Margin="0,0,8,6"
-            Cursor="Hand" Visibility="Collapsed">
-      <TextBlock x:Name="badgeRenamed" Foreground="#5ED4D4" FontFamily="Segoe UI" FontSize="13"/>
-    </Border>
-    <Border x:Name="badgeOldMarkedBorder" Background="#1F1F25" BorderBrush="#9099C8"
-            BorderThickness="1" CornerRadius="4" Padding="10,4" Margin="0,0,8,6"
-            Visibility="Collapsed">
-      <TextBlock x:Name="badgeOldMarked" Foreground="#9099C8" FontFamily="Segoe UI" FontSize="13"/>
     </Border>
     <Border x:Name="badgeVPCleanedBorder" Background="#0F1F2E" BorderBrush="#7AB8E0"
             BorderThickness="1" CornerRadius="4" Padding="10,4" Margin="0,0,8,6"
@@ -2046,12 +1908,6 @@ if n_type_fixed:
 if n_scale_fixed:
     win.FindName("badgeScaleFixedBorder").Visibility = Visibility.Visible
     win.FindName("badgeScaleFixed").Text = u"⚠  {} scale-fixed".format(n_scale_fixed)
-if n_renamed:
-    win.FindName("badgeRenamedBorder").Visibility = Visibility.Visible
-    win.FindName("badgeRenamed").Text = u"✏  {} renamed".format(n_renamed)
-if n_old_marked:
-    win.FindName("badgeOldMarkedBorder").Visibility = Visibility.Visible
-    win.FindName("badgeOldMarked").Text = u"🏷  {} marked (old)".format(n_old_marked)
 if vp_cleaned:
     win.FindName("badgeVPCleanedBorder").Visibility = Visibility.Visible
     win.FindName("badgeVPCleaned").Text = u"🧹  {} VPs cleaned".format(vp_cleaned)
@@ -2091,7 +1947,6 @@ _FILTER_PREDICATES = {
     "error":       lambda r: r._pa_action == "error" or r._pb_status == "error",
     "type_fixed":  lambda r: r._view_name in _type_fixed_names,
     "scale_fixed": lambda r: r._view_name in _scale_fixed_names,
-    "renamed":     lambda r: r._view_name in _renamed_names,
 }
 
 _BADGE_BORDERS = [
@@ -2104,7 +1959,6 @@ _BADGE_BORDERS = [
     ("badgeErrorBorder",      "error"),
     ("badgeTypeFixedBorder",  "type_fixed"),
     ("badgeScaleFixedBorder", "scale_fixed"),
-    ("badgeRenamedBorder",    "renamed"),
 ]
 
 def _apply_filter(filter_key):

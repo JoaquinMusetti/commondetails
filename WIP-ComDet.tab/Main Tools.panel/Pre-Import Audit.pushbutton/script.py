@@ -19,6 +19,7 @@ sys.path.append(_os.path.join(
     'lib'
 ))
 from magictools import ui
+from sheet_naming import building_tag, dest_building_letter
 
 import clr
 clr.AddReference('PresentationCore')
@@ -101,35 +102,8 @@ if not dest_prefix:
 
 dest_prefix = dest_prefix.strip().upper()
 
-SHARED_PREFIX = u"AX"
-
-
-def _building_tag(sheet_number):
-    """Trailing building letter of a sheet number, or None for a shared sheet.
-
-    Number = <2-char prefix> + base + optional '.<Letter>'. The base itself
-    contains dots (e.g. '10.65'), so only a final segment that is exactly one
-    alphabetic char counts as a building tag ('10.65.E' -> 'E', '10.65' -> None)."""
-    if not sheet_number:
-        return None
-    suffix = sheet_number[2:] if len(sheet_number) > 2 else sheet_number
-    parts = suffix.split(u".")
-    last = parts[-1] if parts else u""
-    if len(last) == 1 and last.isalpha():
-        return last.upper()
-    return None
-
-
-def _dest_building_letter(prefix):
-    """Building letter implied by a 2-char destination prefix, else None.
-
-    'AE'->'E', 'AS'->'S'. Shared 'AX' and Common Details 'CD' map to no single
-    building -> None (keep everything, don't over-filter)."""
-    if (len(prefix) == 2 and prefix[0] == u"A"
-            and prefix != SHARED_PREFIX and prefix[1].isalpha()):
-        return prefix[1]
-    return None
-
+# building_tag / dest_building_letter / SHARED_PREFIX live in lib/sheet_naming.py
+# (shared with Import Details so both filter by the same criterion).
 
 # Filter JSON sheets to this destination building. The CD export carries every
 # building's CUSTOM sheets (all AX-prefixed, tagged '.A', '.E'…) plus SHARED
@@ -137,7 +111,7 @@ def _dest_building_letter(prefix):
 # matches this building's letter, so building E is not told it's "missing"
 # building A's custom AX10.65.A. Suffix matching downstream ('10.65' vs
 # '10.65.E') keeps them distinct, so there is no collision.
-_dest_letter = _dest_building_letter(dest_prefix)
+_dest_letter = dest_building_letter(dest_prefix)
 _full_count = len(layout)
 if _dest_letter is None:
     # Can't identify one building (dest is AX / CD) -> keep all, don't over-filter.
@@ -145,7 +119,7 @@ if _dest_letter is None:
 else:
     kept = []
     for sd in layout:
-        tag = _building_tag(sd.get("sheet_number", u""))
+        tag = building_tag(sd.get("sheet_number", u""))
         if tag is None or tag == _dest_letter:
             kept.append(sd)
     layout = kept
